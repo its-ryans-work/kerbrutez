@@ -1,0 +1,100 @@
+name: build-and-release
+
+# Build cross-platform binaries and publish a GitHub Release on every push to
+# main. Version uses the "semvercal" scheme MAJOR.YYYYMMDD.RUN_NUMBER where
+# MAJOR lives in build.zig (const semvercal_major), the date is generated here,
+# and RUN_NUMBER is the GitHub Actions run number.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # Assemble the version string once so every job agrees (avoids date skew).
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          MAJOR=$(grep -oP 'const semvercal_major\s*=\s*\K[0-9]+' build.zig)
+          VERSION="${MAJOR}.$(date +%Y%m%d).${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+  # Quality gate: run the unit tests natively before producing any release.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test
+
+  build:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build (${{ matrix.target }})
+        run: |
+          zig build \
+            -Doptimize=ReleaseSmall \
+            -Dtarget=${{ matrix.target }} \
+            -Dversion=${{ needs.version.outputs.version }}
+      - name: Package binary
+        shell: bash
+        run: |
+          ext=""
+          case "${{ matrix.target }}" in *windows*) ext=".exe" ;; esac
+          mkdir -p dist
+          cp "zig-out/bin/kerbrutez${ext}" "dist/kerbrutez-${{ matrix.target }}${ext}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kerbrutez-${{ matrix.target }}
+          path: dist/kerbrutez-${{ matrix.target }}*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l dist
+          NOTES="Automated build \`${VERSION}\` (built with Zig ${ZIG_VERSION}).
+          Static Linux (musl) + Windows binaries — no runtime dependencies."
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "v${VERSION}" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "v${VERSION}" \
+              --notes "$NOTES"
+          fi

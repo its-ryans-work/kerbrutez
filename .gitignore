@@ -1,0 +1,19 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+# Local testing area (binaries, scripts, results) — never committed
+/testing/
+
+# Live integration-test config — may hold real lab credentials. Never committed.
+.env
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+# Local Claude Code skills (developer aids, not part of the shipped tool)
+.claude/skills/
+
+# Transient scratch logs written by unit tests (normally auto-deleted)
+zz_workers_*.log
+
+# Default per-realm NDJSON state log (written in the CWD when --state is unset)
+kerbrutez-*.ndjson
