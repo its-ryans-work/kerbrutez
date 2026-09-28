@@ -11,9 +11,15 @@ zig-out/
 .claude/settings.local.json
 # Local Claude Code skills (developer aids, not part of the shipped tool)
 .claude/skills/
+# Local agent-skills dir (developer aid, not part of the shipped tool)
+.agents/
 
 # Transient scratch logs written by unit tests (normally auto-deleted)
 zz_workers_*.log
 
 # Default per-realm NDJSON state log (written in the CWD when --state is unset)
 kerbrutez-*.ndjson
+# Unit-test state files and their advisory-lock sidecars (auto-created in the CWD)
+test_*.ndjson
+test_*.ndjson.lock
+*.ndjson.lock

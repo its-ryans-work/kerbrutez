@@ -13,6 +13,11 @@ const pa_data = @import("../types/pa_data.zig");
 pub const Error = error{ UnsupportedEType, MalformedETypeInfo, MalformedETypeInfo2 } ||
     etype_mod.Error || @import("../asn1/der.zig").Error;
 
+/// Cap on the string-to-key salt length. A real salt (REALM + sAMAccountName) is
+/// well under this; the bound stops a hostile/spoofed KDC's oversized PA-DATA
+/// salt from amplifying through the des3 n-fold (~168x) into a memory DoS.
+const max_salt_bytes: usize = 4096;
+
 /// Derive the long-term key for `etype_id` from `password`, choosing the salt
 /// from PA-DATA (PA-ETYPE-INFO2 > PA-ETYPE-INFO > PA-PW-SALT) or, failing that,
 /// the principal's default salt (realm ++ name components).
@@ -36,8 +41,15 @@ pub fn getKeyFromPassword(
         owned_salt = try cname.getSalt(allocator, realm);
         break :blk owned_salt.?;
     };
+    // A legitimate salt is REALM+sAMAccountName, a few hundred bytes at most. The
+    // salt comes from the KDC's PA-ETYPE-INFO2, so a hostile/spoofed KDC could
+    // send a huge one; the des3 n-fold string-to-key replicates it up to ~168x,
+    // so cap it to keep a single derivation from ballooning memory (DoS).
+    if (salt.len > max_salt_bytes) return Error.InvalidS2KParams;
 
-    const s2kparams = info.s2kparams orelse et.defaultS2KParams();
+    // Raw 4-byte wire s2kparams from PA-ETYPE-INFO2, or empty when the KDC sent
+    // none (stringToKey then uses the etype's default iteration count).
+    const s2kparams = info.s2kparams orelse &[_]u8{};
     return etype_mod.stringToKey(allocator, et, password, salt, s2kparams);
 }
 

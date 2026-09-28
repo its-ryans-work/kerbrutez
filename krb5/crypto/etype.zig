@@ -92,12 +92,12 @@ pub const EType = enum(i32) {
         };
     }
 
-    /// Default string-to-key params (hex), governing PBKDF2 iterations.
-    pub fn defaultS2KParams(self: EType) []const u8 {
+    /// Default PBKDF2 iteration count when the KDC advertises no s2kparams.
+    pub fn defaultS2KIterations(self: EType) u32 {
         return switch (self) {
-            .aes128_cts_hmac_sha1_96, .aes256_cts_hmac_sha1_96 => "00001000", // 4096
-            .aes128_cts_hmac_sha256_128, .aes256_cts_hmac_sha384_192 => "00008000", // 32768
-            else => "",
+            .aes128_cts_hmac_sha1_96, .aes256_cts_hmac_sha1_96 => 4096, // RFC 3962
+            .aes128_cts_hmac_sha256_128, .aes256_cts_hmac_sha384_192 => 32768, // RFC 8009
+            else => 0,
         };
     }
 };
@@ -337,12 +337,24 @@ fn deriveKey(allocator: Allocator, et: EType, key: []const u8, constant: []const
 // s2kparams
 // ===========================================================================
 
-fn s2kIterations(s2kparams: []const u8, default_params: []const u8) Error!u32 {
-    const p = if (s2kparams.len == 8) s2kparams else default_params;
-    if (p.len != 8) return Error.InvalidS2KParams;
-    var b: [4]u8 = undefined;
-    _ = std.fmt.hexToBytes(&b, p) catch return Error.InvalidS2KParams;
-    return std.mem.readInt(u32, &b, .big);
+/// Cap on PBKDF2 iterations for one string-to-key. A hostile or spoofed KDC can
+/// advertise an s2kparams count up to 0xFFFFFFFF, which would run PBKDF2 for
+/// ~an hour and hang the worker thread that received the reply — a cheap remote
+/// DoS on a spray. Real AD uses 4096 and RFC 8009 uses 32768; 1,000,000 is far
+/// above any legitimate policy while keeping the worst case well under a second.
+const max_pbkdf2_iters: u32 = 1_000_000;
+
+/// PBKDF2 iteration count from the KDC-advertised s2kparams. s2kparams is the
+/// RAW 4-byte big-endian wire value from PA-ETYPE-INFO2 (NOT hex text) — reading
+/// it as an 8-char hex string ignored every real KDC's value (silent
+/// false-negative: a valid password fails to decrypt a valid AS-REP) and let a
+/// spoofed KDC pass "ffffffff" for 4-billion iterations. Absent/malformed =>
+/// `default_iters`; a 0 count (RFC 3962's "2^32") and anything over the cap are
+/// clamped to `max_pbkdf2_iters`.
+fn s2kIterations(s2kparams: []const u8, default_iters: u32) u32 {
+    const raw = if (s2kparams.len == 4) std.mem.readInt(u32, s2kparams[0..4], .big) else default_iters;
+    const iters = if (raw == 0) max_pbkdf2_iters else raw;
+    return @min(iters, max_pbkdf2_iters);
 }
 
 // ===========================================================================
@@ -355,14 +367,14 @@ pub fn stringToKey(allocator: Allocator, et: EType, secret: []const u8, salt: []
     switch (et) {
         .rc4_hmac => return ntHash(allocator, secret),
         .aes128_cts_hmac_sha1_96, .aes256_cts_hmac_sha1_96 => {
-            const iters = try s2kIterations(s2kparams, et.defaultS2KParams());
+            const iters = s2kIterations(s2kparams, et.defaultS2KIterations());
             const tkey = try allocator.alloc(u8, et.keyByteSize());
             defer allocator.free(tkey);
             std.crypto.pwhash.pbkdf2(tkey, secret, salt, iters, std.crypto.auth.hmac.Hmac(Sha1)) catch return Error.InvalidS2KParams;
             return deriveKey3961(allocator, et, tkey, "kerberos");
         },
         .aes128_cts_hmac_sha256_128, .aes256_cts_hmac_sha384_192 => {
-            const iters = try s2kIterations(s2kparams, et.defaultS2KParams());
+            const iters = s2kIterations(s2kparams, et.defaultS2KIterations());
             // saltp = ename || 0x00 || salt
             var saltp: std.ArrayList(u8) = .empty;
             defer saltp.deinit(allocator);
@@ -762,15 +774,28 @@ test "RC4 NT-hash string-to-key" {
 
 test "AES string-to-key RFC 3962 Appendix B" {
     const salt = "ATHENA.MIT.EDUraeburn";
-    // iteration count 1 (s2kparams 0x00000001)
-    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, "00000001", "42263c6e89f4fc28b8df68ee09799f15");
-    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, "00000001", "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161");
+    // s2kparams is the RAW 4-byte big-endian wire value (NOT hex text).
+    // iteration count 1 (0x00000001)
+    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0, 1 }, "42263c6e89f4fc28b8df68ee09799f15");
+    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0, 1 }, "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161");
     // iteration count 2
-    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, "00000002", "c651bf29e2300ac27fa469d693bdda13");
-    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, "00000002", "a2e16d16b36069c135d5e9d2e25f896102685618b95914b467c67622225824ff");
+    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0, 2 }, "c651bf29e2300ac27fa469d693bdda13");
+    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0, 2 }, "a2e16d16b36069c135d5e9d2e25f896102685618b95914b467c67622225824ff");
     // iteration count 1200 (0x000004b0)
-    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, "000004b0", "4c01cd46d632d01e6dbe230a01ed642a");
-    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, "000004b0", "55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a");
+    try expectKeyHexParams(.aes128_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0x04, 0xb0 }, "4c01cd46d632d01e6dbe230a01ed642a");
+    try expectKeyHexParams(.aes256_cts_hmac_sha1_96, "password", salt, &[_]u8{ 0, 0, 0x04, 0xb0 }, "55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a");
+}
+
+test "s2kIterations reads the raw wire value, defaults when absent, and clamps a hostile count" {
+    // Raw 4-byte big-endian, honoured exactly.
+    try testing.expectEqual(@as(u32, 1), s2kIterations(&[_]u8{ 0, 0, 0, 1 }, 4096));
+    try testing.expectEqual(@as(u32, 1200), s2kIterations(&[_]u8{ 0, 0, 0x04, 0xb0 }, 4096));
+    // Absent/malformed length => default.
+    try testing.expectEqual(@as(u32, 4096), s2kIterations(&[_]u8{}, 4096));
+    try testing.expectEqual(@as(u32, 32768), s2kIterations(&[_]u8{ 0, 1 }, 32768)); // wrong length
+    // A hostile/spoofed 0xFFFFFFFF (and RFC's 0 == 2^32) are clamped, not run.
+    try testing.expectEqual(max_pbkdf2_iters, s2kIterations(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }, 4096));
+    try testing.expectEqual(max_pbkdf2_iters, s2kIterations(&[_]u8{ 0, 0, 0, 0 }, 4096));
 }
 
 test "RFC 8009 KDF DeriveKey test vectors" {

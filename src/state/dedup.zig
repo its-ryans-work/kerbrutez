@@ -82,16 +82,21 @@ pub fn loadFromLog(allocator: Allocator, io: Io, path: []const u8, scope: Scope)
 
     var rbuf: [4096]u8 = undefined;
     var reader = file.reader(io, &rbuf);
-    const content = reader.interface.allocRemaining(allocator, .unlimited) catch return dedup;
+    // Bounded to avoid OOM on a large state log (see store.max_state_bytes).
+    const content = reader.interface.allocRemaining(allocator, .limited(@import("store.zig").max_state_bytes)) catch return dedup;
     defer allocator.free(content);
 
-    const Rec = struct { realm: []const u8, user: []const u8, password: []const u8 };
+    // `kind` defaults to "attempt" so legacy records (no kind field) still count.
+    // A roster record ("user") has an empty password and must not seed a dedup
+    // key, or `spray @state` would treat every ingested user as already tried.
+    const Rec = struct { realm: []const u8, user: []const u8, password: []const u8, kind: []const u8 = "attempt" };
     var it = std.mem.tokenizeScalar(u8, content, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         const parsed = std.json.parseFromSlice(Rec, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
         defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.kind, "attempt")) continue;
         dedup.add(parsed.value.realm, parsed.value.user, parsed.value.password) catch {};
     }
     return dedup;

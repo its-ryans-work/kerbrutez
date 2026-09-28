@@ -21,6 +21,7 @@ test {
     _ = @import("policy/policy.zig");
     _ = @import("workers.zig");
     _ = @import("bloodhound.zig");
+    _ = @import("ingest/nxc.zig");
     _ = @import("cli.zig");
     _ = @import("test_integration.zig");
     std.testing.refAllDecls(@This());

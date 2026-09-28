@@ -124,25 +124,37 @@ pub const Budget = struct {
         return gop.value_ptr;
     }
 
-    /// Drop leading timestamps that have aged out of the trailing window.
-    ///
-    /// ORDERING NOTE: since `refreshFromLog` interleaves other processes'
-    /// timestamps with our own, this list is no longer guaranteed ascending, and
-    /// a clock stepped backwards (NTP) can do the same. That is SAFE here and
-    /// must stay that way: this stops at the first in-window entry, so an older
-    /// timestamp sitting behind a newer one is simply not pruned — the account
-    /// keeps a stale attempt on its ledger and gets MORE pacing, never less.
-    /// Do not "optimise" this into sorting-and-trimming without preserving that
-    /// direction of error.
-    fn prune(list: *std.ArrayListUnmanaged(i64), allocator: Allocator, cutoff: i64) void {
-        var keep: usize = 0;
-        while (keep < list.items.len and list.items[keep] < cutoff) keep += 1;
-        if (keep > 0) {
-            const remaining = list.items.len - keep;
-            std.mem.copyForwards(i64, list.items[0..remaining], list.items[keep..]);
-            list.shrinkRetainingCapacity(remaining);
-            _ = allocator;
+    /// The most recent (largest) timestamp in `list`, or `minInt` if empty. The
+    /// list is NOT guaranteed ascending — `refreshFromLog` interleaves other
+    /// processes' timestamps and NTP can step the clock — so scan for the max
+    /// rather than trusting the last element.
+    fn maxTs(list: *const std.ArrayListUnmanaged(i64)) i64 {
+        var m: i64 = std.math.minInt(i64);
+        for (list.items) |t| {
+            if (t > m) m = t;
         }
+        return m;
+    }
+
+    /// Reset the per-user attempt ledger iff AD would have reset badPwdCount.
+    ///
+    /// THIS IS THE CORE OF THE LOCKOUT MODEL, and it is NOT a sliding window.
+    /// AD's badPwdCount is a STREAK counter: it resets to 0 only after a quiet
+    /// gap of at least lockoutObservationWindow measured from the MOST RECENT bad
+    /// password (badPasswordTime). So bad passwords that keep arriving less than
+    /// a window apart accumulate WITHOUT BOUND — a spray spread across hours
+    /// (spraycampaign's password-major passes over a large user list, or
+    /// --rpm/--delay/jitter) climbs 1,2,3,4,5 and LOCKS even though no trailing
+    /// 30-min window ever held more than a couple. The previous trailing-window
+    /// COUNT (a classic rate-limiter) modelled the wrong thing and silently
+    /// locked accounts. We keep the current STREAK and clear it only once a full
+    /// window of silence has elapsed since the most recent attempt — AD's rule.
+    ///
+    /// A clock stepped backwards makes the gap look smaller (never larger), so it
+    /// errs toward keeping the streak: MORE pacing, never less. Safe.
+    fn resetIfQuiet(self: *Budget, list: *std.ArrayListUnmanaged(i64), now: i64) void {
+        if (list.items.len == 0) return;
+        if (now - maxTs(list) >= self.policy.windowSecs()) list.clearRetainingCapacity();
     }
 
     /// Try to reserve an attempt slot for `user` at time `now` (epoch seconds).
@@ -152,14 +164,18 @@ pub const Budget = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const list = try self.listFor(user);
-        prune(list, self.allocator, now - self.policy.windowSecs());
+        self.resetIfQuiet(list, now);
         if (list.items.len < self.policy.attempts_per_window) {
             try list.append(self.allocator, now);
             return 0;
         }
-        // At capacity: wait until the oldest in-window attempt ages out (+margin).
-        const oldest = list.items[0];
-        const wait = oldest + self.policy.windowSecs() + self.policy.marginSecs() - now;
+        // The streak is full (apw = threshold-1) and AD has NOT reset yet. Wait
+        // until a FULL window+margin of silence has passed since the MOST RECENT
+        // attempt; only then does AD reset and a fresh streak begin. Keying the
+        // wait off the most recent attempt (not the oldest) is what makes a
+        // spread-out campaign safe — refilling as soon as the oldest aged out
+        // would let attempt N+1 land while AD is still counting the streak of N.
+        const wait = maxTs(list) + self.policy.windowSecs() + self.policy.marginSecs() - now;
         return if (wait > 0) wait else 1;
     }
 
@@ -182,13 +198,15 @@ pub const Budget = struct {
         try list.append(self.allocator, ts);
     }
 
-    /// How many attempts are currently counted for `user` within the window.
+    /// How many attempts are in `user`'s CURRENT streak (bad passwords since the
+    /// last window-length quiet gap) — i.e. what AD's badPwdCount would be. Used
+    /// by the lockout predictor.
     pub fn windowCount(self: *Budget, user: []const u8, now: i64) usize {
         self.lock.lock();
         defer self.lock.unlock();
         var kbuf: [account_key_max]u8 = undefined;
         const list = self.attempts.getPtr(accountKey(&kbuf, user)) orelse return 0;
-        prune(list, self.allocator, now - self.policy.windowSecs());
+        self.resetIfQuiet(list, now);
         return list.items.len;
     }
 
@@ -242,7 +260,7 @@ pub const Budget = struct {
         const last_nl = std.mem.lastIndexOfScalar(u8, chunk, '\n') orelse return;
         const complete = chunk[0 .. last_nl + 1];
 
-        const Rec = struct { realm: []const u8, user: []const u8, timestamp: []const u8, run: []const u8 = "", phase: []const u8 = "" };
+        const Rec = struct { realm: []const u8, user: []const u8, timestamp: []const u8, run: []const u8 = "", phase: []const u8 = "", kind: []const u8 = "attempt" };
         var it = std.mem.tokenizeScalar(u8, complete, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -250,6 +268,9 @@ pub const Budget = struct {
             const parsed = std.json.parseFromSlice(Rec, self.allocator, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
             if (!std.mem.eql(u8, parsed.value.realm, self.log_realm)) continue;
+            // Roster ("user") records are not attempts — never charge them to the
+            // per-user budget (default "attempt" keeps counting legacy records).
+            if (!std.mem.eql(u8, parsed.value.kind, "attempt")) continue;
             // Count RESERVATIONS only. Every attempt writes one reservation and
             // one outcome; counting both would halve each account's budget.
             // Older records carry no phase and are counted (one per attempt).
@@ -268,12 +289,13 @@ pub const Budget = struct {
         defer file.close(io);
         var rbuf: [4096]u8 = undefined;
         var reader = file.reader(io, &rbuf);
-        const content = reader.interface.allocRemaining(self.allocator, .unlimited) catch return;
+        // Bounded to avoid OOM on a large state log (see store.max_state_bytes).
+        const content = reader.interface.allocRemaining(self.allocator, .limited(@import("../state/store.zig").max_state_bytes)) catch return;
         defer self.allocator.free(content);
         // Where the incremental tail should resume from.
         self.log_offset = content.len;
 
-        const Rec = struct { realm: []const u8, user: []const u8, timestamp: []const u8, phase: []const u8 = "" };
+        const Rec = struct { realm: []const u8, user: []const u8, timestamp: []const u8, phase: []const u8 = "", kind: []const u8 = "attempt" };
         var it = std.mem.tokenizeScalar(u8, content, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -281,6 +303,7 @@ pub const Budget = struct {
             const parsed = std.json.parseFromSlice(Rec, self.allocator, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
             if (!std.mem.eql(u8, parsed.value.realm, realm)) continue;
+            if (!std.mem.eql(u8, parsed.value.kind, "attempt")) continue; // skip roster records
             if (std.mem.eql(u8, parsed.value.phase, "result")) continue; // see refreshFromLog
             const ts = parseIso8601(parsed.value.timestamp) orelse continue;
             self.addHistorical(parsed.value.user, ts) catch {};
@@ -329,22 +352,58 @@ test "Policy defaults attempts-per-window to threshold-1" {
     try testing.expectEqual(@as(u32, 2), p2.attempts_per_window);
 }
 
-test "tryReserve paces bursts within the window" {
+test "tryReserve paces a burst and only refills after a full quiet gap (streak model)" {
     const a = testing.allocator;
     // apw=2, window=60s, margin=0 for deterministic timing.
     var b = Budget.init(a, .{ .threshold = 3, .window_min = 1, .attempts_per_window = 2, .margin_min = 0 });
     defer b.deinit();
 
     try testing.expectEqual(@as(i64, 0), try b.tryReserve("jon", 0)); // 1st
-    try testing.expectEqual(@as(i64, 0), try b.tryReserve("jon", 1)); // 2nd
-    // 3rd at t=2: at capacity; wait until oldest(0)+60-2 = 58.
-    try testing.expectEqual(@as(i64, 58), try b.tryReserve("jon", 2));
+    try testing.expectEqual(@as(i64, 0), try b.tryReserve("jon", 1)); // 2nd (streak=2=apw)
+    // 3rd at t=2: at capacity; wait keyed to the MOST RECENT (t=1), not the
+    // oldest: 1 + 60 - 2 = 59. (The old sliding-window code returned 58.)
+    try testing.expectEqual(@as(i64, 59), try b.tryReserve("jon", 2));
     // A different user is unaffected.
     try testing.expectEqual(@as(i64, 0), try b.tryReserve("arya", 2));
-    // At t=61 the first (t=0) aged out; one slot frees up.
+    // At t=60 the OLDEST (t=0) has aged out of a trailing window, but the streak
+    // must NOT refill — AD has not reset, because the most recent attempt (t=1)
+    // is only 59s ago (< the 60s window). This is the crux of the fix: the old
+    // sliding-window code granted here and walked the account toward a lockout.
+    try testing.expect((try b.tryReserve("jon", 60)) > 0);
+    // Only once a FULL window of silence has elapsed since the MOST RECENT
+    // attempt (t=1 + 60 = 61) does AD reset and a fresh streak open.
     try testing.expectEqual(@as(i64, 0), try b.tryReserve("jon", 61));
-    // Now jon has [1, 61] in window -> full again.
-    try testing.expect((try b.tryReserve("jon", 61)) > 0);
+}
+
+// REGRESSION for the sliding-window vs AD-reset mismatch. AD's badPwdCount is a
+// streak that resets only after a full window of quiet from the MOST RECENT bad
+// password. A campaign that spreads a user's attempts across the window (every
+// R seconds, R > margin) must NOT be allowed to trickle attempt apw+1 out before
+// AD resets — otherwise it locks the account at ~threshold despite "correct"
+// pacing. Here: threshold 5, window 1800s, apw 4, margin 60, attempts every
+// R=100s at t=0,100,200,300. The 5th reserve must be deferred to a point where a
+// full window of silence has elapsed since the most recent attempt (t>=300+1800),
+// i.e. AD will have reset — never granted early into a still-counting streak.
+test "spread-out campaign never lets a streak reach the threshold" {
+    const a = testing.allocator;
+    var b = Budget.init(a, .{ .threshold = 5, .window_min = 30, .attempts_per_window = 4, .margin_min = 1 });
+    defer b.deinit();
+    const R: i64 = 100;
+    var t: i64 = 0;
+    var granted: usize = 0;
+    while (t <= 300) : (t += R) {
+        if ((try b.tryReserve("victim", t)) == 0) granted += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), granted); // exactly apw, never a 5th
+    // The 5th reserve at t=300 must wait until AD has reset: >= mostRecent(300) +
+    // window(1800) + margin(60) - now(300) = 1860.
+    const wait = try b.tryReserve("victim", 300);
+    try testing.expectEqual(@as(i64, 1860), wait);
+    // Attempting again anywhere inside the still-counting streak stays deferred,
+    // so AD's counter (max 4) can never reach threshold 5.
+    try testing.expect((try b.tryReserve("victim", 300 + 1000)) > 0);
+    // After a full window of silence since the last attempt, a fresh streak opens.
+    try testing.expectEqual(@as(i64, 0), try b.tryReserve("victim", 300 + 1800 + 60));
 }
 
 test "loadFromLog seeds windows from NDJSON timestamps" {

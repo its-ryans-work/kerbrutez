@@ -466,9 +466,15 @@ pub const Pool = struct {
                 // The attempt already happened, so this cannot fail closed —
                 // but a silent failure would leave the budget under-counting
                 // for the rest of the run. Say so.
-                while (extra < outcome.password_guesses) : (extra += 1) b.addHistorical(username, now) catch {
-                    self.logger.warning("[!] {s}: lockout budget is now UNDER-counting (couldn't record an extra password guess) — treat the remaining budget as optimistic.", .{username});
-                };
+                while (extra < outcome.password_guesses) : (extra += 1) {
+                    b.addHistorical(username, now) catch {
+                        self.logger.warning("[!] {s}: lockout budget is now UNDER-counting (couldn't record an extra password guess) — treat the remaining budget as optimistic.", .{username});
+                    };
+                    // Also PUBLISH the extra guess so OTHER concurrent processes
+                    // count it against the shared per-user budget — otherwise they
+                    // tail only one reservation per attempt and jointly overshoot.
+                    if (self.store) |st| st.appendExtraReservation(username) catch {};
+                }
             }
         }
         self.recordAttempt(username, password, outcome);
@@ -732,7 +738,7 @@ test "previously locked accounts are skipped and never charged to --panic-after"
     // Stored under the canonical key; the list below spells her "Alice".
     var prior = store_mod.LockedSet{ .allocator = a };
     defer prior.deinit();
-    try prior.map.put(a, try a.dupe(u8, "alice"), 1_000_000);
+    try prior.map.put(a, try a.dupe(u8, "alice"), .{ .ts = 1_000_000, .reason = .locked });
 
     var pool = testPool(io, &logger);
     pool.allocator = a;

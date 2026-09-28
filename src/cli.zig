@@ -25,6 +25,17 @@ const report_mod = @import("report/report.zig");
 const status_mod = @import("util/status.zig");
 const secret_file = @import("util/secret_file.zig");
 const bloodhound = @import("bloodhound.zig");
+const nxc_ingest = @import("ingest/nxc.zig");
+
+/// Hard ceiling on worker threads (see the --threads parse site). A network-
+/// bound spray/enum gains nothing past this, and higher values only exhaust
+/// local file descriptors and hammer the target DC.
+const max_threads: usize = 256;
+
+/// Upper bound on the spraycampaign users×passwords matrix, which is built fully
+/// in memory. 20M small combos is already ~1 GB; beyond that, refuse rather than
+/// OOM. A real engagement campaign is far smaller.
+const max_combos: usize = 20_000_000;
 
 pub const Flags = struct {
     domain: ?[]const u8 = null,
@@ -75,6 +86,10 @@ pub const Flags = struct {
     exclude_disabled: bool = false,
     /// Offline user source: a BloodHound users.json / dir / .zip (ldapenum).
     bloodhound: ?[]const u8 = null,
+    /// Offline user source: an nxc/NetExec user list (ldapenum). Either a clean
+    /// `--users-export` file (one sAMAccountName per line) or a tee'd/redirected
+    /// capture of `nxc smb/ldap --users`/`--active-users` console output.
+    nxc: ?[]const u8 = null,
     /// kerberoast: roast this single SPN instead of LDAP-enumerating accounts.
     userspn: ?[]const u8 = null,
     /// kerberoast C2: a DONT_REQUIRE_PREAUTH account used to roast --userspn with
@@ -115,8 +130,8 @@ const usage_text =
     \\  bruteuser             <password_list> <username>     Bruteforce a single user's password from a wordlist
     \\  bruteforce            <user_pw_file>                 Bruteforce username:password combos (file or '-')
     \\  spraycampaign         <user(s)> <password(s)>        Resumable, deduped, lockout-paced spray. Each arg is a
-    \\                                                       wordlist file OR a single value (any combination).
-    \\  ldapenum                                             Enumerate users via LDAP, or offline from BloodHound (--bloodhound)
+    \\                                                       wordlist file, a single value, or @state (the persisted roster).
+    \\  ldapenum                                             Ingest users: live via LDAP, or offline from BloodHound (--bloodhound) or nxc (--nxc)
     \\  kerberoast                                           Request TGS tickets for SPN accounts and dump $krb5tgs$ hashes
     \\  wizard                                               Interactive guided mode: answer prompts, review, run
     \\  version                                              Display version info and quit
@@ -188,7 +203,11 @@ const usage_text =
     \\      --ldap-pass string         Bind password
     \\      --exclude-disabled         Drop disabled accounts from the output
     \\      --bloodhound path          Offline source: a BloodHound users.json, a dir, or a SharpHound .zip
+    \\      --nxc path                 Offline source: an nxc/NetExec user list. Either a clean --users-export file
+    \\                                 (one name/line) OR a tee'd/redirected capture of `nxc smb/ldap --users` /
+    \\                                 `--active-users` console output (use '-' to read that capture from stdin).
     \\      -o string                  Write the bare username list to this file (working list)
+    \\      (with -d, ingested users are ALSO saved to the state roster; spray them later with `@state`)
     \\
     \\Kerberoast flags (kerberoast):
     \\      --ldap-user string         Domain credential used to get a TGT (and to enumerate SPNs over LDAP)
@@ -213,6 +232,11 @@ const usage_text =
     \\  kerbrutez passwordspray -d corp.local --dc 10.0.0.10 --noise 1 --socks 127.0.0.1:1080 --canary-file bait.txt users.txt 'P'
     \\  # Offline triage from a BloodHound/SharpHound dump (no network)
     \\  kerbrutez ldapenum -d corp.local --bloodhound ./sharphound.zip -o working_users.txt
+    \\  # Ingest an nxc user list (clean export, or a tee'd --users/--active-users capture) and save the roster
+    \\  nxc smb 10.0.0.10 -u u -p p --users-export users.txt && kerbrutez ldapenum -d corp.local --nxc users.txt
+    \\  nxc ldap 10.0.0.10 -u u -p p --active-users | kerbrutez ldapenum -d corp.local --nxc -
+    \\  # Then spray every ingested user without re-supplying a list
+    \\  kerbrutez spraycampaign -d corp.local --dc 10.0.0.10 @state 'Spring2026!'
     \\
     \\For AUTHORIZED security testing only. Use only against systems you own or have explicit written
     \\permission to assess. You are responsible for complying with all applicable laws.
@@ -290,7 +314,7 @@ fn parseArgs(
             }
         }
 
-        const Need = enum { domain, dc, output, threads, delay, hash_file, etype, state, dedup_scope, lockout_threshold, lockout_window, attempts_per_window, window_margin, panic_after, ldap_user, ldap_pass, ldap_server, bloodhound, userspn, nopreauth_user, target_user, noise, jitter, rpm, tz_offset, canary_file, socks, dns_server, webhook, none };
+        const Need = enum { domain, dc, output, threads, delay, hash_file, etype, state, dedup_scope, lockout_threshold, lockout_window, attempts_per_window, window_margin, panic_after, ldap_user, ldap_pass, ldap_server, bloodhound, nxc, userspn, nopreauth_user, target_user, noise, jitter, rpm, tz_offset, canary_file, socks, dns_server, webhook, none };
         var need: Need = .none;
 
         if (eqAny(name, &.{ "-d", "--domain" })) {
@@ -329,6 +353,8 @@ fn parseArgs(
             need = .ldap_server;
         } else if (std.mem.eql(u8, name, "--bloodhound")) {
             need = .bloodhound;
+        } else if (std.mem.eql(u8, name, "--nxc")) {
+            need = .nxc;
         } else if (std.mem.eql(u8, name, "--userspn")) {
             need = .userspn;
         } else if (std.mem.eql(u8, name, "--nopreauth-user")) {
@@ -426,7 +452,11 @@ fn parseArgs(
             .output => flags.output = value,
             .hash_file => flags.hash_file = value,
             .etype => flags.etype = krb5.config.EtypePref.parse(value) orelse return error.InvalidEtype,
-            .threads => flags.threads = std.fmt.parseInt(usize, value, 10) catch return error.InvalidNumber,
+            // Clamp to a sane ceiling: a spray/enum is network-bound, so hundreds
+            // of threads only exhaust local fds and storm the client's DC (a DoS
+            // the operator did not intend) — and login modes are further capped to
+            // --panic-after downstream. 256 is far past any useful concurrency.
+            .threads => flags.threads = @min(@max(std.fmt.parseInt(usize, value, 10) catch return error.InvalidNumber, 1), max_threads),
             .delay => flags.delay_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidNumber,
             .state => flags.state_path = value,
             .dedup_scope => flags.dedup_scope = value,
@@ -439,6 +469,7 @@ fn parseArgs(
             .ldap_pass => flags.ldap_pass = value,
             .ldap_server => flags.ldap_server = value,
             .bloodhound => flags.bloodhound = value,
+            .nxc => flags.nxc = value,
             .userspn => flags.userspn = value,
             .nopreauth_user => flags.nopreauth_user = value,
             .target_user => flags.target_user = value,
@@ -691,13 +722,42 @@ fn runBruteforce(allocator: Allocator, io: Io, flags: Flags, args: []const []con
 fn runSprayCampaign(allocator: Allocator, io: Io, flags: Flags, args: []const []const u8) u8 {
     if (args.len != 2) return cmdArgError(io, "spraycampaign requires <users> <passwords> (each a wordlist file or a single value)");
 
+    // Users source: "@state" (the persisted roster) or a file/literal. The
+    // roster owns each element AND the slice; a file/literal is a resolveList
+    // result whose lines borrow `users_backing`. Free the right one only.
     var users_backing: ?[]u8 = null;
     defer if (users_backing) |b| allocator.free(b);
-    const users = resolveList(allocator, io, args[0], &users_backing) catch {
+    var roster_owned: ?[][]const u8 = null;
+    defer if (roster_owned) |r| {
+        for (r) |u| allocator.free(u);
+        allocator.free(r);
+    };
+    const users: []const []const u8 = if (std.mem.eql(u8, args[0], "@state")) blk: {
+        const domain = flags.domain orelse {
+            printErr(io, "@state needs -d/--domain to know which realm's roster to spray\n", .{});
+            return 1;
+        };
+        var realm_buf: [256]u8 = undefined;
+        if (domain.len > realm_buf.len) return cmdArgError(io, "domain too long");
+        for (domain, 0..) |c, i| realm_buf[i] = std.ascii.toUpper(c);
+        const realm = realm_buf[0..domain.len];
+        const state_path = flags.state_path orelse defaultStatePath(realm);
+        const r = store_mod.loadRosterFromLog(allocator, io, state_path, realm) catch {
+            printErr(io, "could not read the roster from {s}\n", .{state_path});
+            return 1;
+        };
+        if (r.len == 0) {
+            printErr(io, "@state: no persisted users in {s} for realm {s}. Run an ingest first (e.g. `kerbrutez ldapenum -d {s} --nxc <file>`).\n", .{ state_path, realm, domain });
+            allocator.free(r);
+            return 1;
+        }
+        roster_owned = r;
+        break :blk r;
+    } else resolveList(allocator, io, args[0], &users_backing) catch {
         printErr(io, "could not read users: {s}\n", .{args[0]});
         return 1;
     };
-    defer allocator.free(users);
+    defer if (roster_owned == null) allocator.free(users);
 
     var pass_backing: ?[]u8 = null;
     defer if (pass_backing) |b| allocator.free(b);
@@ -706,6 +766,15 @@ fn runSprayCampaign(allocator: Allocator, io: Io, flags: Flags, args: []const []
         return 1;
     };
     defer allocator.free(passwords);
+
+    // Guard against a multiplicative OOM: the full users×passwords matrix is
+    // materialised in memory below, so two large lists (e.g. a full-domain roster
+    // × rockyou) can exhaust RAM before a single attempt is made. Refuse an
+    // absurd product up front with an actionable message rather than crash.
+    if (users.len != 0 and passwords.len > max_combos / users.len) {
+        printErr(io, "spraycampaign: {d} users x {d} passwords = too many combinations (limit {d}). Split the password list, or spray fewer users per run.\n", .{ users.len, passwords.len, max_combos });
+        return 1;
+    }
 
     // Build the matrix in PASSWORD-MAJOR order so the per-user lockout budget
     // paces between rounds (a round = one password against every user).
@@ -741,7 +810,7 @@ fn resolveList(allocator: Allocator, io: Io, arg: []const u8, backing: *?[]u8) !
         defer f.close(io);
         var buf: [64 * 1024]u8 = undefined;
         var r = f.reader(io, &buf);
-        const content = try r.interface.allocRemaining(allocator, .unlimited);
+        const content = try r.interface.allocRemaining(allocator, .limited(max_input_bytes));
         backing.* = content;
         return splitLines(allocator, content);
     } else |_| {
@@ -1600,7 +1669,9 @@ fn deriveSpnLabel(spn: []const u8) []const u8 {
 /// Enumerate domain users via LDAP, flagging disabled / SPN (kerberoastable) /
 /// no-preauth (AS-REP-roastable) accounts. With `-o`, writes a bare user list.
 fn runLdapenum(allocator: Allocator, io: Io, flags: Flags) u8 {
-    // Offline source: ingest a BloodHound dump instead of querying LDAP.
+    // Offline sources: ingest a BloodHound dump or an nxc user list instead of
+    // querying LDAP.
+    if (flags.nxc) |nxc_path| return runNxcEnum(allocator, io, flags, nxc_path);
     if (flags.bloodhound) |bh_path| return runBloodhoundEnum(allocator, io, flags, bh_path);
 
     const domain = flags.domain orelse {
@@ -1639,6 +1710,11 @@ fn runLdapenum(allocator: Allocator, io: Io, flags: Flags) u8 {
     }
     defer if (out_file) |f| f.close(io);
 
+    // Bare names actually emitted (post --exclude-disabled), for roster persist.
+    // BORROW: elements point into `result`, which outlives the persist call.
+    var roster: std.ArrayList([]const u8) = .empty;
+    defer roster.deinit(allocator);
+
     var total: u32 = 0;
     var disabled_n: u32 = 0;
     var spn_n: u32 = 0;
@@ -1655,6 +1731,7 @@ fn runLdapenum(allocator: Allocator, io: Io, flags: Flags) u8 {
         if (is_disabled) disabled_n += 1;
         if (spns.len > 0) spn_n += 1;
         if (is_nopreauth) nopreauth_n += 1;
+        roster.append(allocator, sam) catch {};
 
         const badpwd: u32 = if (e.first("badPwdCount")) |s| (std.fmt.parseInt(u32, s, 10) catch 0) else 0;
         var fbuf: [256]u8 = undefined;
@@ -1673,6 +1750,9 @@ fn runLdapenum(allocator: Allocator, io: Io, flags: Flags) u8 {
     if (flags.output) |path| logger.info("Wrote {d} usernames to {s}", .{ total, path });
 
     logger.info("Done! Enumerated {d} users ({d} disabled, {d} with SPN, {d} AS-REP-roastable)", .{ total, disabled_n, spn_n, nopreauth_n });
+
+    // Persist the roster so `spray @state` can reuse it without a fresh list.
+    persistRoster(allocator, io, flags, &logger, domain, roster.items);
     return 0;
 }
 
@@ -1704,6 +1784,11 @@ fn runBloodhoundEnum(allocator: Allocator, io: Io, flags: Flags, path: []const u
     }
     defer if (out_file) |f| f.close(io);
 
+    // Bare names actually emitted (post --exclude-disabled), for roster persist.
+    // BORROW: elements point into `users`, which outlives the persist call below.
+    var roster: std.ArrayList([]const u8) = .empty;
+    defer roster.deinit(allocator);
+
     var total: u32 = 0;
     var disabled_n: u32 = 0;
     var spn_n: u32 = 0;
@@ -1714,6 +1799,7 @@ fn runBloodhoundEnum(allocator: Allocator, io: Io, flags: Flags, path: []const u
         if (!u.enabled) disabled_n += 1;
         if (u.has_spn) spn_n += 1;
         if (u.dont_require_preauth) nopreauth_n += 1;
+        roster.append(allocator, u.sam) catch {};
 
         var fbuf: [256]u8 = undefined;
         var fb = std.Io.Writer.fixed(&fbuf);
@@ -1733,7 +1819,117 @@ fn runBloodhoundEnum(allocator: Allocator, io: Io, flags: Flags, path: []const u
     if (flags.output) |p| logger.info("Wrote {d} usernames to {s}", .{ total, p });
 
     logger.info("Done! Ingested {d} users ({d} disabled, {d} with SPN, {d} AS-REP-roastable)", .{ total, disabled_n, spn_n, nopreauth_n });
+
+    // Persist the roster so `spray @state` can reuse it without a fresh list.
+    if (flags.domain) |d| persistRoster(allocator, io, flags, &logger, d, roster.items);
     return 0;
+}
+
+/// Offline `ldapenum` from an nxc/NetExec user list. Accepts either a clean
+/// `--users-export` file (one sAMAccountName per line) or a tee'd/redirected
+/// capture of `nxc smb/ldap --users` / `--active-users` console output — see
+/// ingest/nxc.zig for why the console capture is the only way to get an
+/// active-only list. Writes the bare working list with `-o`, and (with `-d`)
+/// persists the roster to state for `spray @state`.
+fn runNxcEnum(allocator: Allocator, io: Io, flags: Flags, path: []const u8) u8 {
+    var logger = Logger.init(io, flags.verbose, null) catch return 1;
+    defer logger.deinit();
+    logger.info("nxc: ingesting {s} (offline)", .{path});
+
+    const content = readInput(allocator, io, path) catch {
+        logger.err("could not read nxc list {s}", .{path});
+        return 1;
+    };
+    defer allocator.free(content);
+
+    var parsed = nxc_ingest.parse(allocator, content) catch {
+        logger.err("out of memory parsing nxc list", .{});
+        return 1;
+    };
+    defer parsed.deinit();
+
+    if (parsed.console_format) {
+        logger.info("[*] Detected nxc CONSOLE output (tee'd/redirected): stripped the 'PROTO IP PORT HOST' prefix and skipped {d} banner/header/credential line(s).", .{parsed.banners});
+    }
+    if (parsed.dropped > 0) {
+        logger.warning("[!] Dropped {d} line(s) that were not plausible usernames (kept them OUT of the spray rather than guessing them). Re-check the source if a real account is missing.", .{parsed.dropped});
+    }
+    if (parsed.duplicates > 0) {
+        logger.info("[*] Collapsed {d} case-insensitive duplicate name(s).", .{parsed.duplicates});
+    }
+    if (parsed.users.len == 0) {
+        logger.err("no usernames found in {s} — is it really an nxc --users/--users-export/--active-users output?", .{path});
+        return 1;
+    }
+    // Disabled/built-in accounts ARE included by nxc: `--users-export` dumps all
+    // users, and even `--active-users --users-export` writes ALL of them to the
+    // file (only the console is active-only). Spraying disabled/built-in accounts
+    // wastes lockout budget and adds noise — flag the obvious ones.
+    if (parsed.well_known > 0) {
+        logger.warning("[!] The list contains {d} built-in account(s) (krbtgt/Guest) — not useful spray targets. Consider trimming them.", .{parsed.well_known});
+    }
+    logger.warning("[!] nxc user lists include DISABLED accounts (and, from --users-export, ALL users regardless of --active-users). To spray only enabled accounts, capture 'nxc ldap ... --active-users' CONSOLE output (tee/redirect), not the exported file.", .{});
+
+    // Optional working-list output file (bare sAMAccountNames), owner-only.
+    if (flags.output) |p| {
+        var out_file = secret_file.create(io, p, .{ .truncate = true }) catch {
+            logger.err("could not write working list {s}", .{p});
+            return 1;
+        };
+        defer out_file.close(io);
+        var out_buf: [4096]u8 = undefined;
+        var w = out_file.writerStreaming(io, &out_buf);
+        for (parsed.users) |u| w.interface.print("{s}\n", .{u}) catch {};
+        w.interface.flush() catch {};
+        logger.info("Wrote {d} usernames to {s}", .{ parsed.users.len, p });
+    }
+
+    for (parsed.users) |u| {
+        if (flags.domain) |d| logger.notice("[+] {s}@{s}", .{ u, d }) else logger.notice("[+] {s}", .{u});
+    }
+    logger.info("Done! Ingested {d} user(s) from nxc output.", .{parsed.users.len});
+
+    // Persist the roster so `spray @state` can reuse it without a fresh list.
+    if (flags.domain) |d| persistRoster(allocator, io, flags, &logger, d, parsed.users);
+    return 0;
+}
+
+/// Persist an ingested/enumerated user roster to the shared per-realm state log
+/// (record kind "user"), so a later `spray @state` can target every known user
+/// without re-supplying a list. Best-effort: a state-write failure never fails
+/// the ingest. No-op under --no-state. `domain` is used to derive the realm
+/// (which is what a later spray keys on).
+fn persistRoster(allocator: Allocator, io: Io, flags: Flags, logger: *Logger, domain: []const u8, users: []const []const u8) void {
+    if (flags.no_state) {
+        logger.info("[*] --no-state: not persisting the roster (pass a state file to enable `spray @state`).", .{});
+        return;
+    }
+    if (users.len == 0) return;
+
+    // realm = UPPER(domain); the store keys roster records on it, and `spray
+    // @state` looks them up under the same realm.
+    var realm_buf: [256]u8 = undefined;
+    if (domain.len > realm_buf.len) {
+        logger.warning("[!] domain too long to persist roster", .{});
+        return;
+    }
+    for (domain, 0..) |c, i| realm_buf[i] = std.ascii.toUpper(c);
+    const realm = realm_buf[0..domain.len];
+
+    const state_path = flags.state_path orelse defaultStatePath(realm);
+    const dc = flags.dc orelse "offline";
+    var store = store_mod.Store.open(allocator, io, state_path, realm, dc) catch {
+        logger.warning("[!] could not open state file {s} to persist the roster", .{state_path});
+        return;
+    };
+    defer store.deinit();
+
+    var n: usize = 0;
+    for (users) |u| {
+        store.appendUser(u) catch continue;
+        n += 1;
+    }
+    logger.info("[*] Persisted {d} user(s) to {s}. Spray them later with:  kerbrutez spraycampaign -d {s} --dc <dc> @state <password(s)>", .{ n, state_path, domain });
 }
 
 /// Connect + simple-bind an LDAP client per the flags (UPN bind if creds given,
@@ -2188,6 +2384,8 @@ fn collisionCheckOk(
     domain: []const u8,
     threshold: u32,
     window_min: u32,
+    is_campaign: bool,
+    apw: u32,
 ) bool {
     var planned = plannedAttemptsPerUser(allocator, lines, mode, dedup, realm, flags.retry);
     defer freePlannedKeys(allocator, &planned);
@@ -2202,14 +2400,22 @@ fn collisionCheckOk(
     while (it.next()) |e| {
         const plan = e.value_ptr.*;
         if (plan == 0) continue;
+        // A CAMPAIGN paces itself, so it will add at most `apw` attempts to this
+        // user in the CURRENT observation window (the budget enforces it, this run
+        // and others); the rest spill into later windows after AD resets. Judging
+        // a campaign by its TOTAL planned attempts falsely flags every list whose
+        // password count exceeds the threshold. A one-shot run has no pacing, so
+        // its whole planned count lands in one window — judge it in full.
+        const exposure: u32 = if (is_campaign) @min(plan, apw) else plan;
         const recent = budget.windowCount(e.key_ptr.*, now);
-        // recent (already logged, this run + others) + new attempts this run.
-        if (recent + @as(usize, plan) >= @as(usize, threshold)) {
+        // recent (already logged, this run + others) + attempts this run adds in
+        // the current window.
+        if (recent + @as(usize, exposure) >= @as(usize, threshold)) {
             at_risk += 1;
             if (recent >= worst_recent) {
                 worst_recent = recent;
                 worst_user = e.key_ptr.*;
-                worst_plan = plan;
+                worst_plan = exposure;
                 const last = budget.mostRecent(e.key_ptr.*) orelse now;
                 worst_ago_min = @divTrunc(now - last, 60);
             }
@@ -2293,12 +2499,37 @@ fn runPool(
     var session = buildSession(allocator, io, &logger, flags, force_safe) orelse return 1;
     defer session.deinit();
 
-    // Acquire the work lines from a file/stdin, or use the caller's pre-built list.
+    // Acquire the work lines from a file/stdin, the "@state" roster, or the
+    // caller's pre-built list.
     var owned_content: ?[]u8 = null;
     defer if (owned_content) |c| allocator.free(c);
+    // The @state roster owns each element AND the slice (unlike the file path,
+    // whose lines borrow owned_content); free both.
+    var owned_roster: ?[]const []const u8 = null;
+    defer if (owned_roster) |r| {
+        for (r) |u| allocator.free(u);
+        allocator.free(r);
+    };
     var owned_lines = false;
     const raw_lines: []const []const u8 = switch (input) {
         .path => |p| blk: {
+            if (std.mem.eql(u8, p, "@state")) {
+                // Spray every user persisted to the per-realm roster (from a prior
+                // `ldapenum`/`--nxc`/`--bloodhound` ingest) — no fresh list needed.
+                const state_path = flags.state_path orelse defaultStatePath(session.config.realm);
+                const roster = store_mod.loadRosterFromLog(allocator, io, state_path, session.config.realm) catch {
+                    logger.err("could not read the roster from {s}", .{state_path});
+                    return 1;
+                };
+                if (roster.len == 0) {
+                    logger.err("@state: no persisted users in {s} for realm {s}. Run an ingest first (e.g. `kerbrutez ldapenum -d <domain> --nxc <file>`).", .{ state_path, session.config.realm });
+                    allocator.free(roster);
+                    return 1;
+                }
+                owned_roster = roster;
+                logger.info("[*] @state: sourcing {d} user(s) from the roster in {s}", .{ roster.len, state_path });
+                break :blk roster;
+            }
             owned_content = readInput(allocator, io, p) catch {
                 logger.err("could not read input {s}", .{p});
                 return 1;
@@ -2310,16 +2541,51 @@ fn runPool(
     };
     defer if (owned_lines) allocator.free(raw_lines);
 
+    // Guard: a tee'd nxc CONSOLE capture (or pasted banners) fed straight to a
+    // spray. Those lines are not usernames — "SMB .. [+] dom\\user:pass" reduces
+    // to the operator's OWN account and would spray their real password, and
+    // "SMB .. alice.admin .. desc" becomes a space-filled bogus principal that
+    // the KDC answers PRINCIPAL_UNKNOWN, so the whole run is a silent 0-success
+    // no-op. Drop such artifacts up front (username-bearing modes only; bruteuser
+    // lines are PASSWORDS and must never be filtered), and point the operator at
+    // the safe ingest path. See ingest/nxc.zig.
+    var artifact_backing: ?[][]const u8 = null;
+    defer if (artifact_backing) |b| allocator.free(b);
+    const scanned_lines: []const []const u8 = switch (mode) {
+        .bruteuser => raw_lines,
+        else => blk: {
+            var artifacts: usize = 0;
+            for (raw_lines) |ln| {
+                if (nxc_ingest.isIngestArtifact(ln)) artifacts += 1;
+            }
+            if (artifacts == 0) break :blk raw_lines;
+            var kept: std.ArrayList([]const u8) = .empty;
+            for (raw_lines) |ln| {
+                if (!nxc_ingest.isIngestArtifact(ln)) kept.append(allocator, ln) catch {
+                    kept.deinit(allocator);
+                    break :blk raw_lines; // OOM: fall back to unfiltered rather than abort
+                };
+            }
+            logger.warning("[!] Dropped {d} line(s) that look like raw nxc console/banner output (e.g. 'SMB … [+] dom\\user:pass' or a '-Username-' table) — these are NOT usernames and will not be sprayed. To ingest an nxc list safely, run:  kerbrutez ldapenum -d {s} --nxc <file>  (then spray with @state).", .{ artifacts, domain });
+            artifact_backing = kept.toOwnedSlice(allocator) catch break :blk raw_lines;
+            break :blk artifact_backing.?;
+        },
+    };
+    if (scanned_lines.len == 0) {
+        logger.err("[!] no usable usernames left after dropping nxc artifacts — did you feed raw 'nxc --users'/'--active-users' output? Ingest it first with `kerbrutez ldapenum --nxc <file>`.", .{});
+        return 1;
+    }
+
     // Collapse duplicate work BEFORE any worker starts. Two entries naming the
     // same AD account with the same password are one guess, and sending both
     // spends the account's lockout budget twice for nothing.
-    const deduped = dedupeWorkItems(allocator, raw_lines, mode);
+    const deduped = dedupeWorkItems(allocator, scanned_lines, mode);
     defer if (deduped) |d| allocator.free(d);
     if (deduped) |d| {
-        const dropped = raw_lines.len - d.len;
-        logger.warning("[*] Collapsed {d} duplicate entr{s} ({d} -> {d}): the same account+password appears more than once (case-insensitive). Each duplicate would spend another of that account's bad-password budget for nothing.", .{ dropped, if (dropped == 1) @as([]const u8, "y") else "ies", raw_lines.len, d.len });
+        const dropped = scanned_lines.len - d.len;
+        logger.warning("[*] Collapsed {d} duplicate entr{s} ({d} -> {d}): the same account+password appears more than once (case-insensitive). Each duplicate would spend another of that account's bad-password budget for nothing.", .{ dropped, if (dropped == 1) @as([]const u8, "y") else "ies", scanned_lines.len, d.len });
     }
-    const lines = deduped orelse raw_lines;
+    const lines = deduped orelse scanned_lines;
 
     // Reporting (M10): collect findings; rendered/saved after the run.
     var report = report_mod.Report.init(allocator, count_noun, domain, session.config.realm, session.config.kdc orelse "dns-srv");
@@ -2383,10 +2649,16 @@ fn runPool(
         logger.warning("[!] --attempts-per-window {d} is >= the lockout threshold {d}: that would lock every account in the list. Clamped to {d}.", .{ policy.requested_attempts_per_window, policy.threshold, apw });
     }
     if (enforce_budget and !policy_fetched) {
-        // The budget is only as safe as the window it assumes. If the domain's
-        // real observation window is LONGER than ours, we hand out a second
-        // batch while AD is still counting the first, and the account locks.
-        logger.warning("[!] Lockout policy ASSUMED (threshold {d}, {d}-min window), not read from AD. If the domain's real observation window is longer than {d} min this pacing can still lock accounts — use --policy-fetch with LDAP creds to read the true policy.", .{ policy.threshold, policy.window_min, policy.window_min });
+        // The budget can only be as safe as the policy it assumes, and with no
+        // LDAP creds the tool cannot know the real one. TWO ways an assumption
+        // locks accounts: (1) the real THRESHOLD is lower than assumed — the more
+        // common and more dangerous case, since the budget then hands out MORE bad
+        // passwords than the real threshold allows; (2) the real observation
+        // WINDOW is longer than assumed, so a second batch lands while AD is still
+        // counting the first.
+        logger.warning("[!] Lockout policy ASSUMED (threshold {d}, {d}-min window), NOT read from AD.", .{ policy.threshold, policy.window_min });
+        logger.warning("[!]   -> If the domain's REAL lockout threshold is LOWER than {d} (e.g. a hardened 3), this pacing WILL lock accounts (it allows up to {d} bad passwords/user/window). The tool has no way to know the real threshold without creds.", .{ policy.threshold, policy.attempts_per_window });
+        logger.warning("[!]   -> If the real observation WINDOW is longer than {d} min, spread-out attempts can also lock. Use --policy-fetch (LDAP creds) to read the true policy, or set --lockout-threshold to the value you confirmed out-of-band.", .{policy.window_min});
     }
     const is_login = switch (mode) {
         .enumerate => false,
@@ -2455,6 +2727,20 @@ fn runPool(
         const scope: dedup_mod.Scope = if (std.mem.eql(u8, flags.dedup_scope, "none")) .none else .realm;
         const dc = session.config.kdc orelse "dns-srv";
 
+        // FAIL CLOSED on an unreadable state file. The replay readers below all
+        // swallow read errors and return empty — a silent fail-OPEN: an existing
+        // log that can't be read (too large to fit the cap, transient FS error)
+        // would make the run forget every prior attempt AND every prior lockout
+        // and re-spray with a full fresh budget, locking the client's accounts
+        // whose real badPwdCount is still counting. Detect it here, before any
+        // worker starts, and refuse rather than guess unaccounted.
+        if (statePreflight(io, state_path)) |ok| {
+            if (!ok) {
+                logger.err("[!] state file {s} exists but could NOT be fully read (too large, or a filesystem error). Refusing to spray: continuing would forget prior attempts/lockouts and could lock accounts. Fix or move the file, or pass --no-state to run without cross-run lockout memory.", .{state_path});
+                return 1;
+            }
+        } else |_| {}
+
         // Identify this process in the shared log so the budget can tell its own
         // attempts from those of other concurrent runs (see refreshFromLog).
         var run_id_buf: [17]u8 = undefined;
@@ -2506,7 +2792,7 @@ fn runPool(
 
         // Pre-spray cross-run lockout safeguard (only meaningful with a policy).
         if (enforce_budget) {
-            if (!collisionCheckOk(allocator, io, &logger, flags, lines, mode, &dedup_storage.?, &budget_storage.?, session.config.realm, domain, policy.threshold, policy.window_min)) {
+            if (!collisionCheckOk(allocator, io, &logger, flags, lines, mode, &dedup_storage.?, &budget_storage.?, session.config.realm, domain, policy.threshold, policy.window_min, effective_campaign, apw)) {
                 return 2; // operator declined / no TTY to confirm
             }
         }
@@ -2765,7 +3051,11 @@ fn cmdArgError(io: Io, msg: []const u8) u8 {
 
 /// Split `content` into lines, trimming a trailing '\r' on each.
 /// OWNERSHIP: caller frees the returned slice (line contents borrow `content`).
-fn splitLines(allocator: Allocator, content: []const u8) ![]const []const u8 {
+fn splitLines(allocator: Allocator, content_in: []const u8) ![]const []const u8 {
+    // Strip a leading UTF-8 BOM (Windows tools / PowerShell redirects add one) so
+    // the first entry is not a bogus "\u{FEFF}Administrator" that silently misses
+    // the real account. The nxc ingest path strips this too (ingest/nxc.zig).
+    const content = if (std.mem.startsWith(u8, content_in, "\xEF\xBB\xBF")) content_in[3..] else content_in;
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(allocator);
     var it = std.mem.splitScalar(u8, content, '\n');
@@ -2780,18 +3070,42 @@ fn splitLines(allocator: Allocator, content: []const u8) ![]const []const u8 {
     return list.toOwnedSlice(allocator);
 }
 
+/// Upper bound on a single wordlist / combo file / stdin read. Generous enough
+/// for rockyou-scale lists (~130 MB) while stopping an endless pipe or an absurd
+/// file from OOMing the box.
+const max_input_bytes: usize = 1024 * 1024 * 1024; // 1 GiB
+
 /// Read a whole input (file path, or "-" for stdin). OWNERSHIP: caller frees.
 fn readInput(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
     var buf: [64 * 1024]u8 = undefined;
     if (std.mem.eql(u8, path, "-")) {
         var f = Io.File.stdin();
         var r = f.reader(io, &buf);
-        return r.interface.allocRemaining(allocator, .unlimited);
+        return r.interface.allocRemaining(allocator, .limited(max_input_bytes));
     }
     var f = try Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     var r = f.reader(io, &buf);
-    return r.interface.allocRemaining(allocator, .unlimited);
+    return r.interface.allocRemaining(allocator, .limited(max_input_bytes));
+}
+
+/// Can the shared state log be fully read? true = readable (or absent — a fresh
+/// run), false = it exists but a bounded read failed (too large for the replay
+/// cap, or a filesystem error). Callers fail CLOSED on false rather than let the
+/// replay readers silently return empty (see runPool). Uses a throwaway arena so
+/// the (up to max_state_bytes) probe read is freed immediately.
+fn statePreflight(io: Io, path: []const u8) !bool {
+    var file = Io.Dir.cwd().openFile(io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return true, // fresh run
+        else => return false, // exists but unopenable (perms/FS) -> fail closed
+    };
+    defer file.close(io);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var rbuf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    _ = reader.interface.allocRemaining(arena.allocator(), .limited(store_mod.max_state_bytes)) catch return false;
+    return true;
 }
 
 fn printOut(io: Io, comptime fmt: []const u8, args: anytype) void {
