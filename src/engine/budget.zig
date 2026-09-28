@@ -195,6 +195,11 @@ pub const Budget = struct {
             try list.append(self.allocator, now);
             return 0;
         }
+        // Degenerate config: attempts_per_window == 0 means "allow nothing", so the
+        // list is empty here yet already "at capacity". maxTs on an empty list is
+        // minInt(i64), and adding the window would underflow (panic in Safe/Debug,
+        // wrap in ReleaseSmall). Just defer — an apw of 0 permits no attempt.
+        if (list.items.len == 0) return self.policy.windowSecs() + self.policy.marginSecs();
         // The streak is full (apw = threshold-1) and AD has NOT reset yet. Wait
         // until a FULL window+margin of silence has passed since the MOST RECENT
         // attempt; only then does AD reset and a fresh streak begin. Keying the
@@ -221,13 +226,18 @@ pub const Budget = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const list = try self.listFor(user);
-        // Cap per-user memory. A legitimate streak is tiny (<= threshold, since the
-        // account locks/gets pulled beyond that); a huge list can only come from a
-        // poisoned/future-dated shared log that keeps resetIfQuiet from firing.
-        // Once we hold far more than any threshold, the account is unambiguously
-        // over budget, so dropping further seeds changes no decision — it only
-        // bounds memory. (Over-count, never under: safe for lockout.)
-        if (list.items.len >= max_streak_entries) return;
+        // Cap per-user memory. A legitimate streak is tiny (<= threshold); a huge
+        // list can only come from a poisoned/reused shared log. When capped, evict
+        // the OLDEST timestamp, NEVER the newest — the log replays chronologically,
+        // so dropping newest would leave maxTs STALE, making windowCount read 0 and
+        // the collision check / predictor MISS a live streak (an under-count that
+        // locks accounts). Keeping the most-recent `max_streak_entries` preserves a
+        // fresh maxTs and the "over-count, never under" invariant.
+        if (list.items.len >= max_streak_entries) {
+            const drop = list.items.len - max_streak_entries + 1;
+            std.mem.copyForwards(i64, list.items[0 .. list.items.len - drop], list.items[drop..]);
+            list.shrinkRetainingCapacity(list.items.len - drop);
+        }
         try list.append(self.allocator, ts);
     }
 
@@ -487,6 +497,41 @@ test "windowCount does not clear the streak tryReserve is still holding" {
     try testing.expect((try b.tryReserve("svc", 1800)) > 0);
     // Only after the full window+margin of quiet does it reset and grant.
     try testing.expectEqual(@as(i64, 0), try b.tryReserve("svc", 1860));
+}
+
+// REGRESSION: the per-user list cap must evict the OLDEST timestamp, not drop the
+// newest. Dropping the newest (the earlier bug) left maxTs stale, so windowCount
+// read 0 and the collision check / predictor missed a live streak -> lockout.
+test "addHistorical cap keeps a fresh maxTs so windowCount sees a live streak" {
+    const a = testing.allocator;
+    var b = Budget.init(a, .{ .threshold = 5, .window_min = 30, .attempts_per_window = 4, .margin_min = 1 });
+    defer b.deinit();
+    // Fill PAST the cap with OLD timestamps (chronological, like a big log replay).
+    var t: i64 = 1000;
+    var i: usize = 0;
+    while (i < max_streak_entries + 50) : (i += 1) {
+        try b.addHistorical("svc", t);
+        t += 1;
+    }
+    // Then one RECENT attempt, far after the old ones (a fresh run against a
+    // reused state log). With drop-newest this was discarded (maxTs stayed old);
+    // with evict-oldest it is kept and maxTs is fresh.
+    const now: i64 = 5_000_000;
+    try b.addHistorical("svc", now);
+    // windowCount (bare window) must see a live streak, not 0.
+    try testing.expect(b.windowCount("svc", now) > 0);
+    try testing.expect(b.windowCount("svc", now) <= max_streak_entries);
+}
+
+// REGRESSION: attempts_per_window == 0 (a degenerate explicit config) must not
+// underflow. The list is empty yet "at capacity", so maxTs would be minInt and
+// adding the window would underflow (panic in Safe/Debug).
+test "tryReserve with attempts_per_window 0 defers without underflow" {
+    const a = testing.allocator;
+    var b = Budget.init(a, .{ .threshold = 5, .window_min = 30, .attempts_per_window = 0, .margin_min = 1 });
+    defer b.deinit();
+    const w = try b.tryReserve("svc", 1000);
+    try testing.expect(w > 0); // apw 0 permits no attempt -> always defer
 }
 
 test "loadFromLog seeds windows from NDJSON timestamps" {

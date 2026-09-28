@@ -89,7 +89,7 @@ pub fn loadFromLog(allocator: Allocator, io: Io, path: []const u8, scope: Scope)
     // `kind` defaults to "attempt" so legacy records (no kind field) still count.
     // A roster record ("user") has an empty password and must not seed a dedup
     // key, or `spray @state` would treat every ingested user as already tried.
-    const Rec = struct { realm: []const u8, user: []const u8, password: []const u8, kind: []const u8 = "attempt" };
+    const Rec = struct { realm: []const u8, user: []const u8, password: []const u8, kind: []const u8 = "attempt", phase: []const u8 = "" };
     var it = std.mem.tokenizeScalar(u8, content, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -97,6 +97,11 @@ pub fn loadFromLog(allocator: Allocator, io: Io, path: []const u8, scope: Scope)
         const parsed = std.json.parseFromSlice(Rec, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.kind, "attempt")) continue;
+        // Skip RESERVATION records (phase "attempt", empty password): they are the
+        // pre-attempt budget marker, not a tried combo. Counting them seeds a
+        // spurious empty-password dedup key and inflates the "prior attempts" total.
+        // Legacy records (no phase) and outcome records (phase "result") count.
+        if (std.mem.eql(u8, parsed.value.phase, "attempt")) continue;
         dedup.add(parsed.value.realm, parsed.value.user, parsed.value.password) catch {};
     }
     return dedup;

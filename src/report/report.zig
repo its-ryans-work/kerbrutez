@@ -158,7 +158,14 @@ pub const Report = struct {
 
     /// Human-readable raw report.
     pub fn writeRaw(self: *Report, w: *std.Io.Writer) !void {
-        try w.print("kerbrutez report — command={s} realm={s} dc={s}\n", .{ self.command, self.realm, self.dc });
+        // realm/dc/domain are also data-derived (a wizard reverse-DNS auto-discovery
+        // reads a PTR record the target controls), so scrub them like the per-finding
+        // fields — command is a fixed literal and is safe.
+        try w.print("kerbrutez report — command={s} realm=", .{self.command});
+        try log.scrubFieldInto(w, self.realm);
+        try w.writeAll(" dc=");
+        try log.scrubFieldInto(w, self.dc);
+        try w.writeByte('\n');
         const c = self.counts();
         try w.print("valid_users={d} valid_creds={d} expired={d} asrep={d} tgs={d} locked={d}\n\n", .{ c.valid_users, c.valid_creds, c.expired, c.asrep, c.tgs, c.locked });
         for (self.findings.items) |f| {
@@ -168,7 +175,8 @@ pub const Report = struct {
             // the console logger already does this; this file writer must too.
             try w.print("[{s}] ", .{f.kind.label()});
             try log.scrubFieldInto(w, f.user);
-            try w.print("@{s}", .{self.domain});
+            try w.writeByte('@');
+            try log.scrubFieldInto(w, self.domain);
             if (f.note) |n| {
                 try w.writeAll(" (");
                 try log.scrubFieldInto(w, n);

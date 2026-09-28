@@ -5,7 +5,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const builtin = @import("builtin");
 const net = std.Io.net;
 const Config = @import("../config/config.zig").Config;
 const dns = @import("../config/dns.zig");
@@ -91,23 +90,6 @@ fn splitHostPort(s: []const u8, default_port: u16) HostPort {
 /// SOCKS5 proxies listen on 1080 by default.
 const socks_default_port: u16 = 1080;
 
-/// Per-attempt read/write timeout (seconds) on a connected TCP stream — normal
-/// KDC round-trips are sub-second; this is the cap that stops a stalled SOCKS
-/// proxy or a half-open DC from hanging a worker (and thus the whole spray).
-const tcp_timeout_secs: isize = 30;
-
-/// Best-effort SO_RCVTIMEO/SO_SNDTIMEO on a connected stream. POSIX only:
-/// SO_*TIMEO takes a `timeval` there, whereas Windows takes a DWORD-ms and is
-/// left unbounded (the tool's operational target is Linux/Kali). A setsockopt
-/// failure is ignored — this is a safety cap, not a precondition for the run.
-fn setStreamTimeout(stream: net.Stream) void {
-    if (builtin.os.tag == .windows) return;
-    const tv = std.posix.timeval{ .sec = tcp_timeout_secs, .usec = 0 };
-    const bytes = std.mem.asBytes(&tv);
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
-    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
-}
-
 /// Resolve a KDC host string to an address. std.Io.net.IpAddress.resolve only
 /// parses IP literals (no DNS), so for a hostname (a typed --dc or an SRV
 /// target) fall back to a DNS A lookup via the same nameserver SRV discovery uses.
@@ -163,9 +145,6 @@ fn sendTCP(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Error![]
             break :blk net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch continue;
         };
         defer stream.close(io);
-        // Bound the read/write so a half-open DC (or stalled proxy) fails this
-        // attempt after `tcp_timeout_secs` rather than hanging the whole spray.
-        setStreamTimeout(stream);
 
         // Write 4-byte BE length prefix + data.
         var hdr: [4]u8 = undefined;
@@ -223,9 +202,6 @@ fn socks5Connect(io: Io, allocator: Allocator, cfg: Config, proxy: HostPort, tar
     const paddr = resolveAddr(io, allocator, cfg, proxy.host, proxy.port) catch return SocksError.SocksConnectFailed;
     var stream = net.IpAddress.connect(&paddr, io, .{ .mode = .stream, .protocol = .tcp }) catch return SocksError.SocksConnectFailed;
     errdefer stream.close(io);
-    // Bound every read/write, so a stalled proxy can't hang the handshake (or the
-    // later KDC I/O on the returned stream) forever.
-    setStreamTimeout(stream);
 
     var wbuf: [320]u8 = undefined;
     var rbuf: [320]u8 = undefined;
