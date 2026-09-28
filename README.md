@@ -161,10 +161,15 @@ automatically.
 
 kerbrutez is validated **live** against:
 
-* a local **Samba 4.x Active Directory DC**, and
+* a local **Samba 4.x Active Directory DC**,
 * **[GOAD](https://github.com/Orange-Cyberdefense/GOAD)** (Game of Active
   Directory) — Orange Cyberdefense's real Windows Server AD lab, on **Windows
-  Server 2019 / 2016** domain controllers.
+  Server 2019 / 2016** domain controllers, and
+* a **Windows Server 2022** DC, where the lockout-safety behaviour was checked
+  against ground truth: paced spray campaigns, cross-process coordination (many
+  simultaneous runs against one account), and the nxc user-ingest flow were
+  verified never to exceed the domain's lockout threshold (badPwdCount / 4740
+  event-log confirmed).
 
 Every offensive primitive was end-to-end verified there — including cracking the
 captured AS-REP / TGS hashes with **[hashcat](https://hashcat.net/)** (modes

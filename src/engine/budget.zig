@@ -154,7 +154,14 @@ pub const Budget = struct {
     /// errs toward keeping the streak: MORE pacing, never less. Safe.
     fn resetIfQuiet(self: *Budget, list: *std.ArrayListUnmanaged(i64), now: i64) void {
         if (list.items.len == 0) return;
-        if (now - maxTs(list) >= self.policy.windowSecs()) list.clearRetainingCapacity();
+        // Reset only after window+margin of silence, matching the at-capacity WAIT
+        // in tryReserve. Using the bare window here would clear our streak the
+        // instant AD's own window elapses, with no safety cushion — so attempts
+        // arriving at ~exactly the window interval (external --rpm/--delay pacing,
+        // or another operator) could reset us to 1 while AD, measuring the boundary
+        // slightly differently, is still counting up toward the threshold. The
+        // margin makes our reset strictly LATER than AD's, so we never under-count.
+        if (now - maxTs(list) >= self.policy.windowSecs() + self.policy.marginSecs()) list.clearRetainingCapacity();
     }
 
     /// Try to reserve an attempt slot for `user` at time `now` (epoch seconds).
@@ -321,6 +328,12 @@ pub fn parseIso8601(s: []const u8) ?i64 {
     const mi = parseN(s[14..16]) orelse return null;
     const se = parseN(s[17..19]) orelse return null;
     if (mo < 1 or mo > 12 or d < 1 or d > 31) return null;
+    // Reject implausible years. A far-future timestamp (a skewed clock or a
+    // tampered shared log) would make maxTs believe the streak is "very recent"
+    // forever, so resetIfQuiet never fires and the user's attempt list grows
+    // without bound — a self-DoS. Records outside this range are skipped by the
+    // readers (orelse continue) or, for the locked-set, fail closed.
+    if (y < 1970 or y > 2100) return null;
     return daysFromCivil(@intCast(y), mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + se;
 }
 

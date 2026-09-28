@@ -2567,7 +2567,10 @@ fn runPool(
                 };
             }
             logger.warning("[!] Dropped {d} line(s) that look like raw nxc console/banner output (e.g. 'SMB … [+] dom\\user:pass' or a '-Username-' table) — these are NOT usernames and will not be sprayed. To ingest an nxc list safely, run:  kerbrutez ldapenum -d {s} --nxc <file>  (then spray with @state).", .{ artifacts, domain });
-            artifact_backing = kept.toOwnedSlice(allocator) catch break :blk raw_lines;
+            artifact_backing = kept.toOwnedSlice(allocator) catch {
+                kept.deinit(allocator); // don't leak the buffer if the shrink OOMs
+                break :blk raw_lines;
+            };
             break :blk artifact_backing.?;
         },
     };
@@ -2722,6 +2725,13 @@ fn runPool(
         logger.warning("[*] --no-state: no local artifact, so NO cross-run dedup, collision check, or memory of accounts locked by earlier runs. In-run pacing and lockout prediction still apply.", .{});
     }
 
+    // FUNCTION-SCOPE so it outlives the worker pool: `run_id` (below) borrows this
+    // buffer and is stored in the store/budget, which the worker threads read from
+    // pool.run() AFTER the `if (state_on)` block closes. Declaring the buffer
+    // inside that block left run_id dangling into freed stack — and a corrupted
+    // run_id breaks the cross-process "is this my own log line?" test, which is
+    // exactly what keeps concurrent runs from jointly locking an account.
+    var run_id_buf: [17]u8 = undefined;
     if (state_on) {
         const state_path = flags.state_path orelse defaultStatePath(session.config.realm);
         const scope: dedup_mod.Scope = if (std.mem.eql(u8, flags.dedup_scope, "none")) .none else .realm;
@@ -2743,7 +2753,8 @@ fn runPool(
 
         // Identify this process in the shared log so the budget can tell its own
         // attempts from those of other concurrent runs (see refreshFromLog).
-        var run_id_buf: [17]u8 = undefined;
+        // run_id_buf is function-scoped (declared above) so run_id stays valid for
+        // the whole run.
         const run_id = std.fmt.bufPrint(&run_id_buf, "{x}", .{krb5.rng.nonce(io) catch @as(i32, 0)}) catch "run";
 
         dedup_storage = dedup_mod.loadFromLog(allocator, io, state_path, scope) catch dedup_mod.Dedup.init(allocator, scope);

@@ -186,8 +186,11 @@ fn classifyLine(line_in: []const u8, console_seen: *bool) Line {
         // Banner/status/credential/header rows carry no account name.
         if (content0.len > 0 and content0[0] == '[') return .banner;
         if (std.mem.eql(u8, content0, "-Username-")) return .banner;
-        // A data row's first content token is the sAMAccountName.
-        return if (plausibleSam(content0)) .{ .user = content0 } else .dropped;
+        // A data row's first content token is the sAMAccountName. Reduce it the
+        // same way as the bare path (strip a DOMAIN\ / @realm the table might
+        // carry) so both paths normalise identically before validation.
+        const reduced_row = username_util.formatUsername(content0) catch return .dropped;
+        return if (plausibleSam(reduced_row)) .{ .user = reduced_row } else .dropped;
     }
 
     // Not a console line. Treat as a clean-export / hand-written entry: it must
@@ -250,9 +253,15 @@ pub fn parse(allocator: Allocator, content_in: []const u8) !Result {
             res.duplicates += 1;
             continue;
         }
+        // Once `owned_key` is in `seen`, the `seen` deinit defer owns it — do NOT
+        // also hold an errdefer for it, or a later OOM would free it here AND
+        // again in that defer (double-free). Handle the put failure inline
+        // instead, and only errdefer the parts not yet handed off.
         const owned_key = try allocator.dupe(u8, key);
-        errdefer allocator.free(owned_key);
-        try seen.put(allocator, owned_key, {});
+        seen.put(allocator, owned_key, {}) catch |e| {
+            allocator.free(owned_key);
+            return e;
+        };
 
         const owned_user = try allocator.dupe(u8, cand);
         errdefer allocator.free(owned_user);
@@ -408,6 +417,19 @@ test "bare pasted banner/header lines (no proto prefix) are dropped" {
     try expectHasUser(&r, "alice.admin");
     try expectNoUser(&r, "svc-scan:Passw0rd!");
     try expectNoUser(&r, "svc-scan");
+}
+
+test "parse handles allocation failure at every point without leak or double-free" {
+    // Exhaustively fails allocation 0,1,2,... and checks each path frees cleanly.
+    // This is the regression guard for the owned_key double-free (seen-map owns
+    // the key AND an errdefer freed it) and the owned_user leak on the OOM path.
+    const in = "alice.admin\nBOB.JONES\nalice.admin\nsvc-scan\n[+] dom\\u:p\nSMB 10.0.0.10 445 DC01 carol\n";
+    try std.testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(alloc: std.mem.Allocator, input: []const u8) !void {
+            var r = try parse(alloc, input);
+            r.deinit();
+        }
+    }.run, .{in});
 }
 
 test "empty input yields an empty roster, no crash" {

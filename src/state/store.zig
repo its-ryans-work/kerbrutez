@@ -355,12 +355,32 @@ pub fn loadLockedFromLog(allocator: Allocator, io: Io, path: []const u8, realm: 
                 // seen the account disabled/expired, keep it out for good.
                 if (is_revoked) gop.value_ptr.reason = .revoked;
             }
-        } else if (set.map.fetchRemove(user)) |kv| {
-            // Answered normally since the lockout — it is back in play.
-            allocator.free(kv.key);
+        } else if (resultProvesUsable(parsed.value.result)) {
+            // Clear the lock ONLY on an AUTHORITATIVE KDC verdict that the account
+            // answered normally. A network_error (KDC never answered) or a
+            // decrypt_error (our own crypto path) proves NOTHING about the
+            // account, yet the old unconditional else cleared the lock for every
+            // non-locked/revoked result — so a transient blip after a lockout
+            // record silently put a locked (or permanently disabled) client
+            // account back into the spray. Fail closed: keep it out unless a real
+            // verdict says otherwise.
+            if (set.map.fetchRemove(user)) |kv| allocator.free(kv.key);
         }
     }
     return set;
+}
+
+/// Does this attempt `result` prove the account is usable again (so a prior
+/// lockout/revocation record should be cleared)? Only authoritative KDC verdicts
+/// count: the account accepted or rejected a credential, or answered with an
+/// expired password / clock skew (pre-auth still succeeded). Inconclusive
+/// outcomes — network_error, decrypt_error — and the ambiguous user_unknown do
+/// NOT clear a recorded lockout.
+fn resultProvesUsable(result: []const u8) bool {
+    inline for (.{ "valid", "invalid", "expired", "skew" }) |ok| {
+        if (std.mem.eql(u8, result, ok)) return true;
+    }
+    return false;
 }
 
 /// Replay the NDJSON store and collect every username persisted to the ROSTER
@@ -413,7 +433,10 @@ pub fn loadRosterFromLog(allocator: Allocator, io: Io, path: []const u8, realm: 
             continue;
         };
         const owned_user = try allocator.dupe(u8, parsed.value.user);
-        try out.append(allocator, owned_user);
+        out.append(allocator, owned_user) catch |e| {
+            allocator.free(owned_user); // don't leak the dupe if append OOMs
+            return e;
+        };
     }
     return out.toOwnedSlice(allocator);
 }
@@ -668,6 +691,36 @@ test "a reservation does not clear a locked account" {
     var set2 = loadLockedFromLog(a, io, path, "EXAMPLE.COM");
     defer set2.deinit();
     try testing.expect(!set2.isBlocked("alice", 1_000, 30 * 60));
+}
+
+test "a transient network/decrypt error does NOT clear a recorded lockout or revocation" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "test_transient_clear.ndjson";
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        var s = try Store.open(a, io, path, "EXAMPLE.COM", "dc:88");
+        defer s.deinit();
+        // alice: locked, then a later NETWORK error (KDC never answered).
+        try s.append(.{ .user = "alice", .password = "p", .result = .locked });
+        try s.append(.{ .user = "alice", .password = "p2", .result = .network_error });
+        // bob: revoked (disabled), then a later DECRYPT error (our crypto path).
+        try s.append(.{ .user = "bob", .password = "p", .result = .revoked });
+        try s.append(.{ .user = "bob", .password = "p2", .result = .decrypt_error });
+        // carol: locked, then an AUTHORITATIVE invalid -> genuinely back in play.
+        try s.append(.{ .user = "carol", .password = "p", .result = .locked });
+        try s.append(.{ .user = "carol", .password = "p2", .result = .invalid });
+    }
+    var set = loadLockedFromLog(a, io, path, "EXAMPLE.COM");
+    defer set.deinit();
+    // Inconclusive outcomes must leave the lock/revocation intact (fail closed).
+    try testing.expect(set.isBlocked("alice", 1_000, 30 * 60));
+    try testing.expect(set.isBlocked("bob", 4_000_000_000, 30 * 60)); // revoked: never ages
+    // An authoritative verdict clears it.
+    try testing.expect(!set.isBlocked("carol", 1_000, 30 * 60));
 }
 
 test "roster round-trips and dedups case-insensitively, realm-scoped" {

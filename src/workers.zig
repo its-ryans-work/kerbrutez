@@ -104,6 +104,9 @@ pub const Pool = struct {
     /// early — at `panic_after - (T-1)` — so the worst-case total still lands on
     /// `panic_after`. With one worker this equals `panic_after` (an exact cap).
     panic_trip: u32 = 3,
+    /// One-shot guard so the "cross-process lock unavailable" warning is emitted
+    /// at most once per run rather than on every attempt.
+    lock_warned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     locked_users: std.StringHashMapUnmanaged(void) = .{},
     locked_lock: SpinLock = .{},
     locked_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -288,10 +291,20 @@ pub const Pool = struct {
     /// never worse.
     const Reservation = union(enum) { granted, wait_secs: i64, failed };
 
+    /// Warn ONCE if we expected the cross-process lock but couldn't take it —
+    /// otherwise the per-user cap silently drops to in-process-only (e.g. on a
+    /// filesystem without advisory locking, or an overlay/network mount), and two
+    /// operators sharing that state file could jointly lock accounts with no hint.
+    fn warnLockUnavailable(self: *Pool) void {
+        if (self.lock_warned.swap(true, .seq_cst)) return;
+        self.logger.warning("[!] could not take the cross-process state lock — falling back to the in-process budget ONLY. If another kerbrutez run shares this state file (or filesystem has no advisory locking), the per-user lockout cap is NOT coordinated between them. Use a local filesystem, or run one process at a time.", .{});
+    }
+
     fn reserveSlot(self: *Pool, user: []const u8, b: *Budget) Reservation {
         const now_ms = Io.Timestamp.now(self.io, .awake).toMilliseconds();
         const guard: ?Io.File = if (self.store) |st| st.lockExclusive(self.io) else null;
         defer if (guard) |g| g.close(self.io);
+        if (self.store != null and guard == null) self.warnLockUnavailable();
 
         // Under the lock, our view of other runs must be current, so bypass the
         // refresh rate limit — the whole point is to see the latest state.
@@ -327,6 +340,7 @@ pub const Pool = struct {
             // policy allows — the exact outcome this machinery prevents.
             const guard: ?Io.File = if (self.store) |st| st.lockExclusive(self.io) else null;
             defer if (guard) |g| g.close(self.io);
+            if (self.store != null and guard == null) self.warnLockUnavailable();
             if (guard != null) b.last_refresh_ms = 0;
             b.refreshFromLog(self.io, Io.Timestamp.now(self.io, .awake).toMilliseconds());
             // ENFORCE THE CAP HERE TOO. A one-shot run does not pace, but it must
