@@ -147,7 +147,8 @@ pub const Report = struct {
             try w.writeAll(f.kind.label());
             try w.writeByte('\t');
             try writeGrepField(w, f.user);
-            try w.print("@{s}", .{self.domain});
+            try w.writeByte('@');
+            try writeGrepField(w, self.domain); // domain is data-derived (wizard reverse-DNS) — escape it too
             if (f.secret) |s| {
                 try w.writeByte('\t');
                 try writeGrepField(w, s);

@@ -2078,6 +2078,12 @@ const ClampReason = enum { unchanged, safe, adjusted };
 /// Worker count + panic-stop trip point for a run (see planLockoutConcurrency).
 const LockoutPlan = struct { threads: usize, panic_trip: u32, reason: ClampReason, from: usize };
 
+/// The MOST PA-ENC-TIMESTAMP guesses one logical attempt can put on the wire, and
+/// thus the most badPwdCounts AD can charge for it: the initial guess plus one
+/// etype/salt-corrected retry (see krb5/client/client.zig). Concurrency planning
+/// must assume every in-flight attempt costs this much.
+pub const max_guesses_per_attempt: u32 = 2;
+
 /// Plan concurrency + the panic-stop trip point so a password-guessing run can
 /// never lock more than --panic-after accounts, even with requests in flight.
 /// Capping threads at `panic_after` bounds how many attempts can be on the wire;
@@ -2086,11 +2092,21 @@ const LockoutPlan = struct { threads: usize, panic_trip: u32, reason: ClampReaso
 /// stop a hair under). With one worker the trip equals `panic_after` (exact cap).
 /// --safe runs a single thread (it aborts on the first lockout). Enumeration sends
 /// no passwords and can't lock accounts, so it is never clamped.
-fn planLockoutConcurrency(want: usize, safe: bool, panic_after: u32, is_login: bool) LockoutPlan {
+///
+/// THREADS ARE ALSO CAPPED BY THE PER-WINDOW BUDGET. When several workers target
+/// the SAME account (bruteuser, or a single-account combo file), each reserves one
+/// budget slot BEFORE its KDC call but a key/salt-mismatched account then costs TWO
+/// badPwdCounts per attempt, charged only AFTER the round-trip. So T concurrent
+/// attempts can put up to T*max_guesses bad passwords in one window before the
+/// budget catches up. Capping T at apw/max_guesses keeps that worst case within the
+/// per-window budget (= threshold-1), so a legacy RC4/odd-salt target can't be
+/// locked by a default multi-threaded bruteuser. `apw` is the per-user budget.
+fn planLockoutConcurrency(want: usize, safe: bool, panic_after: u32, is_login: bool, apw: u32) LockoutPlan {
     if (!is_login) return .{ .threads = want, .panic_trip = panic_after, .reason = .unchanged, .from = want };
     if (safe) return .{ .threads = 1, .panic_trip = 1, .reason = if (want <= 1) .unchanged else .safe, .from = want };
     const cap: usize = @max(1, panic_after);
-    const threads = @max(@as(usize, 1), @min(want, cap));
+    const guess_cap: usize = @max(@as(usize, 1), apw / max_guesses_per_attempt);
+    const threads = @max(@as(usize, 1), @min(@min(want, cap), guess_cap));
     const trip: u32 = @intCast(@max(@as(usize, 1), cap - (threads - 1)));
     const adjusted = threads != want or trip < panic_after;
     return .{ .threads = threads, .panic_trip = trip, .reason = if (adjusted) .adjusted else .unchanged, .from = want };
@@ -2100,41 +2116,41 @@ test "planLockoutConcurrency caps threads and trips early to honour --panic-afte
     const t = std.testing;
     // Enumeration: never clamped; no lockouts possible anyway.
     {
-        const p = planLockoutConcurrency(10, false, 3, false);
+        const p = planLockoutConcurrency(10, false, 3, false, 100);
         try t.expectEqual(@as(usize, 10), p.threads);
         try t.expectEqual(ClampReason.unchanged, p.reason);
     }
     // Safe mode: one thread, trips on the first lockout.
     {
-        const p = planLockoutConcurrency(10, true, 3, true);
+        const p = planLockoutConcurrency(10, true, 3, true, 100);
         try t.expectEqual(@as(usize, 1), p.threads);
         try t.expectEqual(@as(u32, 1), p.panic_trip);
         try t.expectEqual(ClampReason.safe, p.reason);
     }
     // Single worker: exact cap (trip == panic_after), no warning.
     {
-        const p = planLockoutConcurrency(1, false, 3, true);
+        const p = planLockoutConcurrency(1, false, 3, true, 100);
         try t.expectEqual(@as(usize, 1), p.threads);
         try t.expectEqual(@as(u32, 3), p.panic_trip);
         try t.expectEqual(ClampReason.unchanged, p.reason);
     }
     // want > panic_after: threads capped to panic_after, trip drops to 1.
     {
-        const p = planLockoutConcurrency(10, false, 3, true);
+        const p = planLockoutConcurrency(10, false, 3, true, 100);
         try t.expectEqual(@as(usize, 3), p.threads);
         try t.expectEqual(@as(u32, 1), p.panic_trip);
         try t.expectEqual(ClampReason.adjusted, p.reason);
     }
     // want < panic_after: threads kept, trip = panic_after - (threads-1).
     {
-        const p = planLockoutConcurrency(2, false, 3, true);
+        const p = planLockoutConcurrency(2, false, 3, true, 100);
         try t.expectEqual(@as(usize, 2), p.threads);
         try t.expectEqual(@as(u32, 2), p.panic_trip);
         try t.expectEqual(ClampReason.adjusted, p.reason);
     }
     // Large panic-after: threads stay, trip set so the worst case lands on the cap.
     {
-        const p = planLockoutConcurrency(10, false, 50, true);
+        const p = planLockoutConcurrency(10, false, 50, true, 100);
         try t.expectEqual(@as(usize, 10), p.threads);
         try t.expectEqual(@as(u32, 41), p.panic_trip);
     }
@@ -2144,11 +2160,28 @@ test "planLockoutConcurrency caps threads and trips early to honour --panic-afte
     while (w <= 12) : (w += 1) {
         var pa: u32 = 1;
         while (pa <= 8) : (pa += 1) {
-            const p = planLockoutConcurrency(w, false, pa, true);
+            const p = planLockoutConcurrency(w, false, pa, true, 100);
             try t.expect(p.threads >= 1 and p.threads <= w);
             try t.expect(@as(usize, p.panic_trip) + (p.threads - 1) <= @as(usize, pa));
         }
     }
+}
+
+// REGRESSION: with same-account concurrency (bruteuser) against a key/salt-
+// mismatched account, each attempt costs max_guesses_per_attempt badPwdCounts.
+// Threads must be capped so threads * max_guesses <= apw, or N concurrent workers
+// double past the budget and lock the target (default 3 threads * 2 = 6 > 5).
+test "planLockoutConcurrency caps threads by the per-window budget / guess doubling" {
+    const t = std.testing;
+    // apw=4 (threshold 5): at most 2 concurrent (2*2 = 4 = apw), even though
+    // panic_after would allow 3 and the operator asked for 10.
+    const p = planLockoutConcurrency(10, false, 3, true, 4);
+    try t.expect(p.threads <= 2);
+    try t.expect(p.threads * max_guesses_per_attempt <= 4);
+    // A tight budget (apw=2, threshold 3) clamps to a single worker.
+    try t.expectEqual(@as(usize, 1), planLockoutConcurrency(10, false, 3, true, 2).threads);
+    // apw=0 never underflows and yields at least one thread.
+    try t.expect(planLockoutConcurrency(10, false, 3, true, 0).threads >= 1);
 }
 
 /// Free a `plannedAttemptsPerUser` map. Its keys are OWNED canonical copies, so
@@ -2905,7 +2938,7 @@ fn runPool(
     // Lockout-safety concurrency plan: cap workers at --panic-after and trip the
     // stop early, so even attempts already on the wire can't push the lockout
     // total past the cap. (See planLockoutConcurrency.)
-    const plan = planLockoutConcurrency(flags.threads, flags.safe or force_safe, flags.panic_after, is_login);
+    const plan = planLockoutConcurrency(flags.threads, flags.safe or force_safe, flags.panic_after, is_login, apw);
     pool.panic_trip = plan.panic_trip;
     switch (plan.reason) {
         .unchanged => {},
