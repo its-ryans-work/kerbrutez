@@ -167,21 +167,21 @@ pub const Report = struct {
             // bytes so `cat report.raw.txt` can't be made to forge/hide findings —
             // the console logger already does this; this file writer must too.
             try w.print("[{s}] ", .{f.kind.label()});
-            try log.scrubControlsInto(w, f.user);
+            try log.scrubFieldInto(w, f.user);
             try w.print("@{s}", .{self.domain});
             if (f.note) |n| {
                 try w.writeAll(" (");
-                try log.scrubControlsInto(w, n);
+                try log.scrubFieldInto(w, n);
                 try w.writeByte(')');
             }
             if (f.secret) |s| {
                 if (f.hashcat_mode) |m| {
                     try w.print(" -m {d}\n  ", .{m});
-                    try log.scrubControlsInto(w, s);
+                    try log.scrubFieldInto(w, s);
                     try w.writeByte('\n');
                 } else {
                     try w.writeAll(" : ");
-                    try log.scrubControlsInto(w, s);
+                    try log.scrubFieldInto(w, s);
                     try w.writeByte('\n');
                 }
             } else {
@@ -244,7 +244,8 @@ pub const Report = struct {
             if (f.hashcat_mode != null) continue;
             const s = f.secret orelse continue;
             if (f.kind != .asrep_roast and f.kind != .tgs_roast) continue;
-            fw.interface.print("{s}\n", .{s}) catch {};
+            log.scrubFieldInto(&fw.interface, s) catch {};
+            fw.interface.writeByte('\n') catch {};
         }
         fw.interface.flush() catch {};
     }
@@ -281,7 +282,8 @@ pub const Report = struct {
             for (self.findings.items) |f| {
                 if (f.hashcat_mode != m) continue;
                 const s = f.secret orelse continue;
-                fw.interface.print("{s}\n", .{s}) catch {};
+                log.scrubFieldInto(&fw.interface, s) catch {};
+                fw.interface.writeByte('\n') catch {};
             }
             fw.interface.flush() catch {};
         }

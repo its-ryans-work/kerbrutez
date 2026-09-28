@@ -142,7 +142,10 @@ const usage_text =
     \\                         Accepts a comma-separated list (dc1,dc2,dc3) to spread attempts across
     \\                         DCs round-robin (also gives failover). NOTE: this spreads LOAD and logs,
     \\                         not lockout risk — AD checks bad passwords against the PDC, so the
-    \\                         per-user budget stays domain-wide.
+    \\                         per-user budget stays domain-wide. CAVEAT: if a reply is lost after the
+    \\                         request was sent, failover re-sends it to another DC, which the PDC may
+    \\                         count as a SECOND bad password — with multiple DCs on a strict policy,
+    \\                         prefer --policy-fetch or a conservative --lockout-threshold.
     \\      --dns string       DNS server for SRV KDC discovery when --dc is blank (point at the AD DNS)
     \\  -o, --output string    File to write logs to
     \\  -v, --verbose          Log failures and errors
@@ -154,7 +157,7 @@ const usage_text =
     \\      --delay int        Delay in ms between attempts (forces single thread)
     \\      --etype string     AS-REQ enctype: all (default, noise 3) | aes (stealthier/modern, slow to crack) | rc4 (deprecated, crackable)
     \\      --downgrade        Alias for --etype rc4 (arcfour-hmac-md5)
-    \\      --asrep            (userenum) Dump $krb5asrep$ hashes for no-pre-auth accounts (mode 18200/19600/19700)
+    \\      --asrep            (userenum) Dump $krb5asrep$ hashes for no-pre-auth accounts (hashcat -m 18200 for RC4; AES AS-REPs have NO hashcat mode — crack with John)
     \\      --etype-probe      (userenum) Probe which etypes the KDC accepts per user (matrix; no password sent)
     \\      --hash-file string File to save AS-REP hashes to
     \\      --user-as-pass     (passwordspray) Spray each account with its username as the password
@@ -946,12 +949,16 @@ const Wiz = struct {
 /// it to an FQDN and take the part after the first label. Returns null on
 /// failure. OWNERSHIP: the result is `arena`-owned.
 fn discoverDomain(arena: Allocator, io: Io, dc: []const u8, dns_server: ?[]const u8) ?[]const u8 {
-    const host = splitHostPort(dc, 88).host; // strip any :port
-    if (!isIpv4Literal(host)) {
-        // A hostname: domain = everything after the first label.
+    const raw_host = splitHostPort(dc, 88).host; // strip any :port
+    if (!isIpv4Literal(raw_host)) {
+        // A hostname: domain = everything after the first label. Strip a trailing
+        // dot first (a fully-qualified "dc01.corp.local." is valid) so we don't
+        // derive a realm with a dangling empty label.
+        const host = std.mem.trimEnd(u8, raw_host, ".");
         const dot = std.mem.indexOfScalar(u8, host, '.') orelse return null;
         return arena.dupe(u8, host[dot + 1 ..]) catch null;
     }
+    const host = raw_host;
     // An IP: reverse-DNS to an FQDN, then strip the first label.
     const fqdn = krb5.dns.reverseLookup(arena, io, host, dns_server) orelse return null;
     const trimmed = std.mem.trimEnd(u8, fqdn, ".");

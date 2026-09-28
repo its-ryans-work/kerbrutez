@@ -25,6 +25,15 @@ pub fn scrubControlsInto(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!v
     for (s) |c| try w.writeByte(if (isUnsafeControl(c)) '?' else c);
 }
 
+/// Strict variant for report DATA fields (username / SPN / hash / note): also
+/// neutralizes '\n' and '\t'. Those never legitimately appear in such a field,
+/// and — unlike the console logger, which prefixes only the first line so an
+/// injected newline shows up conspicuously unprefixed — the report file writers
+/// have no per-line prefix, so a raw '\n' in a field would forge a whole record.
+pub fn scrubFieldInto(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    for (s) |c| try w.writeByte(if (c < 0x20 or c == 0x7F) '?' else c);
+}
+
 pub const Level = enum(u8) {
     debug = 0,
     info = 1,

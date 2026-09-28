@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const builtin = @import("builtin");
 const net = std.Io.net;
 const Config = @import("../config/config.zig").Config;
 const dns = @import("../config/dns.zig");
@@ -63,26 +64,48 @@ pub fn sendToKDC(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Er
 
 const HostPort = struct { host: []const u8, port: u16 };
 
-/// Split "host:port" (or "[ipv6]:port"); defaults to port 88.
-fn splitHostPort(s: []const u8) HostPort {
+/// Split "host:port" (or "[ipv6]:port"); when no port is given, `default_port`.
+/// The KDC path passes 88; the SOCKS proxy path passes 1080 (a bare `--socks
+/// 127.0.0.1` otherwise silently tried Kerberos port 88 and failed to connect).
+fn splitHostPort(s: []const u8, default_port: u16) HostPort {
     if (s.len > 0 and s[0] == '[') {
         if (std.mem.indexOfScalar(u8, s, ']')) |close| {
             const host = s[1..close];
             if (close + 2 <= s.len and s[close + 1] == ':') {
-                const port = std.fmt.parseInt(u16, s[close + 2 ..], 10) catch 88;
+                const port = std.fmt.parseInt(u16, s[close + 2 ..], 10) catch default_port;
                 return .{ .host = host, .port = port };
             }
-            return .{ .host = host, .port = 88 };
+            return .{ .host = host, .port = default_port };
         }
     }
     if (std.mem.lastIndexOfScalar(u8, s, ':')) |idx| {
         // Only treat as host:port if there's a single colon (not bare IPv6).
         if (std.mem.count(u8, s, ":") == 1) {
-            const port = std.fmt.parseInt(u16, s[idx + 1 ..], 10) catch 88;
+            const port = std.fmt.parseInt(u16, s[idx + 1 ..], 10) catch default_port;
             return .{ .host = s[0..idx], .port = port };
         }
     }
-    return .{ .host = s, .port = 88 };
+    return .{ .host = s, .port = default_port };
+}
+
+/// SOCKS5 proxies listen on 1080 by default.
+const socks_default_port: u16 = 1080;
+
+/// Per-attempt read/write timeout (seconds) on a connected TCP stream — normal
+/// KDC round-trips are sub-second; this is the cap that stops a stalled SOCKS
+/// proxy or a half-open DC from hanging a worker (and thus the whole spray).
+const tcp_timeout_secs: isize = 30;
+
+/// Best-effort SO_RCVTIMEO/SO_SNDTIMEO on a connected stream. POSIX only:
+/// SO_*TIMEO takes a `timeval` there, whereas Windows takes a DWORD-ms and is
+/// left unbounded (the tool's operational target is Linux/Kali). A setsockopt
+/// failure is ignored — this is a safety cap, not a precondition for the run.
+fn setStreamTimeout(stream: net.Stream) void {
+    if (builtin.os.tag == .windows) return;
+    const tv = std.posix.timeval{ .sec = tcp_timeout_secs, .usec = 0 };
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
 }
 
 /// Resolve a KDC host string to an address. std.Io.net.IpAddress.resolve only
@@ -102,7 +125,7 @@ fn sendUDP(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Error![]
     if (kdcs.len == 0) return Error.NoKDCs;
 
     for (kdcs) |kdc| {
-        const hp = splitHostPort(kdc);
+        const hp = splitHostPort(kdc, 88);
         const addr = resolveAddr(io, allocator, cfg, hp.host, hp.port) catch continue;
         const family_unspec: net.IpAddress = switch (addr) {
             .ip4 => .{ .ip4 = net.Ip4Address.unspecified(0) },
@@ -127,10 +150,10 @@ fn sendTCP(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Error![]
     if (kdcs.len == 0) return Error.NoKDCs;
 
     for (kdcs) |kdc| {
-        const hp = splitHostPort(kdc);
+        const hp = splitHostPort(kdc, 88);
         // Through a SOCKS5 proxy (OPSEC), or a direct TCP connect.
         var stream = if (cfg.socks) |proxy|
-            (socks5Connect(io, allocator, cfg, splitHostPort(proxy), hp.host, hp.port) catch continue)
+            (socks5Connect(io, allocator, cfg, splitHostPort(proxy, socks_default_port), hp.host, hp.port) catch continue)
         else blk: {
             const addr = resolveAddr(io, allocator, cfg, hp.host, hp.port) catch continue;
             // NOTE: Zig 0.16's Threaded Io has not implemented connect-with-timeout
@@ -140,6 +163,9 @@ fn sendTCP(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Error![]
             break :blk net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp }) catch continue;
         };
         defer stream.close(io);
+        // Bound the read/write so a half-open DC (or stalled proxy) fails this
+        // attempt after `tcp_timeout_secs` rather than hanging the whole spray.
+        setStreamTimeout(stream);
 
         // Write 4-byte BE length prefix + data.
         var hdr: [4]u8 = undefined;
@@ -180,7 +206,7 @@ fn sendTCP(io: Io, allocator: Allocator, cfg: Config, data: []const u8) Error![]
 /// to say so rather than look like an unreachable DC.
 pub fn preflightSocks(io: Io, allocator: Allocator, cfg: Config, target_host: []const u8, target_port: u16) SocksError!void {
     const proxy = cfg.socks orelse return;
-    var stream = try socks5Connect(io, allocator, cfg, splitHostPort(proxy), target_host, target_port);
+    var stream = try socks5Connect(io, allocator, cfg, splitHostPort(proxy, socks_default_port), target_host, target_port);
     stream.close(io);
 }
 
@@ -197,6 +223,9 @@ fn socks5Connect(io: Io, allocator: Allocator, cfg: Config, proxy: HostPort, tar
     const paddr = resolveAddr(io, allocator, cfg, proxy.host, proxy.port) catch return SocksError.SocksConnectFailed;
     var stream = net.IpAddress.connect(&paddr, io, .{ .mode = .stream, .protocol = .tcp }) catch return SocksError.SocksConnectFailed;
     errdefer stream.close(io);
+    // Bound every read/write, so a stalled proxy can't hang the handshake (or the
+    // later KDC I/O on the returned stream) forever.
+    setStreamTimeout(stream);
 
     var wbuf: [320]u8 = undefined;
     var rbuf: [320]u8 = undefined;
@@ -248,22 +277,22 @@ const testing = std.testing;
 
 test "splitHostPort variants" {
     {
-        const hp = splitHostPort("dc01.example.com:88");
+        const hp = splitHostPort("dc01.example.com:88", 88);
         try testing.expectEqualStrings("dc01.example.com", hp.host);
         try testing.expectEqual(@as(u16, 88), hp.port);
     }
     {
-        const hp = splitHostPort("10.0.0.1:9999");
+        const hp = splitHostPort("10.0.0.1:9999", 88);
         try testing.expectEqualStrings("10.0.0.1", hp.host);
         try testing.expectEqual(@as(u16, 9999), hp.port);
     }
     {
-        const hp = splitHostPort("::1"); // bare IPv6, no port
+        const hp = splitHostPort("::1", 88); // bare IPv6, no port
         try testing.expectEqualStrings("::1", hp.host);
         try testing.expectEqual(@as(u16, 88), hp.port);
     }
     {
-        const hp = splitHostPort("[fe80::1]:88");
+        const hp = splitHostPort("[fe80::1]:88", 88);
         try testing.expectEqualStrings("fe80::1", hp.host);
         try testing.expectEqual(@as(u16, 88), hp.port);
     }

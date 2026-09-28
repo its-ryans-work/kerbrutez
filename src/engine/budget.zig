@@ -239,8 +239,14 @@ pub const Budget = struct {
         defer self.lock.unlock();
         var kbuf: [account_key_max]u8 = undefined;
         const list = self.attempts.getPtr(accountKey(&kbuf, user)) orelse return 0;
-        // Estimate AD's badPwdCount: AD resets on the bare observation window.
-        self.resetIfQuiet(list, now, self.policy.windowSecs());
+        // READ-ONLY estimate of AD's badPwdCount (AD resets on the bare window).
+        // MUST NOT mutate the list: tryReserve shares this exact per-user list and
+        // deliberately holds it for window+margin. Calling the mutating
+        // resetIfQuiet here with the bare window would CLEAR the streak margin
+        // seconds before tryReserve intends, so the next tryReserve grants early
+        // and can lock the account — the third-pass regression this replaces.
+        if (list.items.len == 0) return 0;
+        if (now - maxTs(list) >= self.policy.windowSecs()) return 0;
         return list.items.len;
     }
 
@@ -297,7 +303,16 @@ pub const Budget = struct {
         defer self.allocator.free(chunk);
 
         // Only consume up to the last complete line.
-        const last_nl = std.mem.lastIndexOfScalar(u8, chunk, '\n') orelse return;
+        const last_nl = std.mem.lastIndexOfScalar(u8, chunk, '\n') orelse {
+            // No newline in the chunk. If we read the full cap, a single line is
+            // longer than max_refresh_bytes — pathological (a real record is tiny),
+            // so it's a poisoned/corrupt log. Skip PAST it so log_offset advances;
+            // otherwise we'd re-read the same chunk forever and never count any
+            // later run's attempts (silent under-count -> lockout). If the chunk
+            // is short, it's just a trailing partial line at EOF — leave it.
+            if (chunk.len >= max_refresh_bytes) self.log_offset += chunk.len;
+            return;
+        };
         const complete = chunk[0 .. last_nl + 1];
 
         const Rec = struct { realm: []const u8, user: []const u8, timestamp: []const u8, run: []const u8 = "", phase: []const u8 = "", kind: []const u8 = "attempt" };
@@ -449,6 +464,29 @@ test "spread-out campaign never lets a streak reach the threshold" {
     try testing.expect((try b.tryReserve("victim", 300 + 1000)) > 0);
     // After a full window of silence since the last attempt, a fresh streak opens.
     try testing.expectEqual(@as(i64, 0), try b.tryReserve("victim", 300 + 1800 + 60));
+}
+
+// REGRESSION: windowCount must be READ-ONLY. It shares each user's attempt list
+// with tryReserve, which holds the streak for window+margin. A prior version had
+// windowCount call the MUTATING resetIfQuiet with the bare window, so a collision
+// pre-flight / predictor call in the [window, window+margin) band cleared the
+// streak and the next tryReserve granted an early attempt — eroding the lockout
+// margin. windowCount must estimate without mutating.
+test "windowCount does not clear the streak tryReserve is still holding" {
+    const a = testing.allocator;
+    // threshold 5, apw 4, window 1800s, margin 60s.
+    var b = Budget.init(a, .{ .threshold = 5, .window_min = 30, .attempts_per_window = 4, .margin_min = 1 });
+    defer b.deinit();
+    var i: usize = 0;
+    while (i < 4) : (i += 1) try testing.expectEqual(@as(i64, 0), try b.tryReserve("svc", 0)); // full streak
+    // t=1800 is inside [window, window+margin): windowCount estimates AD (bare
+    // window) as 0, but must NOT clear the shared streak.
+    try testing.expectEqual(@as(usize, 0), b.windowCount("svc", 1800));
+    // So the next tryReserve at the same instant STILL defers (streak intact),
+    // never granting an early 5th attempt.
+    try testing.expect((try b.tryReserve("svc", 1800)) > 0);
+    // Only after the full window+margin of quiet does it reset and grant.
+    try testing.expectEqual(@as(i64, 0), try b.tryReserve("svc", 1860));
 }
 
 test "loadFromLog seeds windows from NDJSON timestamps" {
