@@ -12,7 +12,8 @@ const secret_file = @import("../util/secret_file.zig");
 const net = std.Io.net;
 const krb5 = @import("krb5");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
-const Logger = @import("../util/log.zig").Logger;
+const log = @import("../util/log.zig");
+const Logger = log.Logger;
 
 /// What a finding represents.
 pub const Kind = enum {
@@ -161,13 +162,27 @@ pub const Report = struct {
         const c = self.counts();
         try w.print("valid_users={d} valid_creds={d} expired={d} asrep={d} tgs={d} locked={d}\n\n", .{ c.valid_users, c.valid_creds, c.expired, c.asrep, c.tgs, c.locked });
         for (self.findings.items) |f| {
-            try w.print("[{s}] {s}@{s}", .{ f.kind.label(), f.user, self.domain });
-            if (f.note) |n| try w.print(" ({s})", .{n});
+            // f.user / f.note / f.secret carry attacker/AD-influenced data (a
+            // sAMAccountName, an SPN, a hash embedding one). Scrub terminal control
+            // bytes so `cat report.raw.txt` can't be made to forge/hide findings —
+            // the console logger already does this; this file writer must too.
+            try w.print("[{s}] ", .{f.kind.label()});
+            try log.scrubControlsInto(w, f.user);
+            try w.print("@{s}", .{self.domain});
+            if (f.note) |n| {
+                try w.writeAll(" (");
+                try log.scrubControlsInto(w, n);
+                try w.writeByte(')');
+            }
             if (f.secret) |s| {
                 if (f.hashcat_mode) |m| {
-                    try w.print(" -m {d}\n  {s}\n", .{ m, s });
+                    try w.print(" -m {d}\n  ", .{m});
+                    try log.scrubControlsInto(w, s);
+                    try w.writeByte('\n');
                 } else {
-                    try w.print(" : {s}\n", .{s});
+                    try w.writeAll(" : ");
+                    try log.scrubControlsInto(w, s);
+                    try w.writeByte('\n');
                 }
             } else {
                 try w.writeByte('\n');
@@ -289,6 +304,11 @@ fn writeGrepField(w: *std.Io.Writer, s: []const u8) !void {
         '\t' => try w.writeAll("\\t"),
         '\n' => try w.writeAll("\\n"),
         '\r' => try w.writeAll("\\r"),
+        // Escape every other C0 control and DEL losslessly. ESC (0x1B) and the
+        // rest would otherwise pass through raw and let an attacker-controlled
+        // name/SPN inject a terminal escape sequence into the .grep.txt
+        // deliverable (forging or hiding findings when it is cat'd).
+        0...8, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => try w.print("\\x{x:0>2}", .{c}),
         else => try w.writeByte(c),
     };
 }
@@ -380,6 +400,34 @@ test "json escaping" {
     var w = std.Io.Writer.fixed(&buf);
     try writeJsonString(&w, "a\"b\\c\n");
     try testing.expectEqualStrings("a\\\"b\\\\c\\n", w.buffered());
+}
+
+// SECURITY REGRESSION TEST. Names/SPNs come from attacker-influenced data (AD
+// sAMAccountName/servicePrincipalName, a BloodHound export, an nxc capture). A
+// terminal escape sequence in one must not reach the .raw.txt / .grep.txt
+// deliverables verbatim, or `cat`-ing the file could forge or hide findings. The
+// console logger already scrubs this; these file writers must too.
+test "report file writers neutralize terminal control bytes in attacker-controlled fields" {
+    const a = testing.allocator;
+    var r = Report.init(a, "kerberoast", "corp.example.com", "CORP.EXAMPLE.COM", "dc:88");
+    defer r.deinit();
+    // A crafted SPN with ESC + CSI that tries to erase the line and forge a hit.
+    r.addTgsRoast("svc", "$krb5tgs$…", "MSSQLSvc/\x1b[2K\r[+] VALID", 19700);
+
+    // writeRaw must scrub ESC/CR to '?' (no raw control bytes reach .raw.txt).
+    var rawbuf: [512]u8 = undefined;
+    var rw = std.Io.Writer.fixed(&rawbuf);
+    try r.writeRaw(&rw);
+    const raw = rw.buffered();
+    try testing.expect(std.mem.indexOfScalar(u8, raw, 0x1b) == null); // no ESC
+    try testing.expect(std.mem.indexOfScalar(u8, raw, '\r') == null); // no raw CR
+
+    // writeGrepField must escape ESC losslessly (\x1b), never emit it raw.
+    var fieldbuf: [64]u8 = undefined;
+    var fieldw = std.Io.Writer.fixed(&fieldbuf);
+    try writeGrepField(&fieldw, "a\x1b[2Kb");
+    try testing.expect(std.mem.indexOfScalar(u8, fieldw.buffered(), 0x1b) == null);
+    try testing.expect(std.mem.indexOf(u8, fieldw.buffered(), "\\x1b") != null);
 }
 
 

@@ -2562,14 +2562,19 @@ fn runPool(
             var kept: std.ArrayList([]const u8) = .empty;
             for (raw_lines) |ln| {
                 if (!nxc_ingest.isIngestArtifact(ln)) kept.append(allocator, ln) catch {
+                    // FAIL CLOSED: falling back to the unfiltered list would spray
+                    // the banner/`[+] dom\user:pass` credential lines we just
+                    // flagged. Refuse instead.
                     kept.deinit(allocator);
-                    break :blk raw_lines; // OOM: fall back to unfiltered rather than abort
+                    logger.err("[!] out of memory filtering nxc artifacts from the user list — refusing to spray rather than risk spraying banner/credential lines.", .{});
+                    return 1;
                 };
             }
             logger.warning("[!] Dropped {d} line(s) that look like raw nxc console/banner output (e.g. 'SMB … [+] dom\\user:pass' or a '-Username-' table) — these are NOT usernames and will not be sprayed. To ingest an nxc list safely, run:  kerbrutez ldapenum -d {s} --nxc <file>  (then spray with @state).", .{ artifacts, domain });
             artifact_backing = kept.toOwnedSlice(allocator) catch {
-                kept.deinit(allocator); // don't leak the buffer if the shrink OOMs
-                break :blk raw_lines;
+                kept.deinit(allocator);
+                logger.err("[!] out of memory finalizing the filtered user list — refusing to spray.", .{});
+                return 1;
             };
             break :blk artifact_backing.?;
         },
@@ -2755,7 +2760,17 @@ fn runPool(
         // attempts from those of other concurrent runs (see refreshFromLog).
         // run_id_buf is function-scoped (declared above) so run_id stays valid for
         // the whole run.
-        const run_id = std.fmt.bufPrint(&run_id_buf, "{x}", .{krb5.rng.nonce(io) catch @as(i32, 0)}) catch "run";
+        // Build a per-PROCESS id that stays UNIQUE even if the RNG fails. The old
+        // `nonce catch 0` collapsed every RNG-failing process to run_id "0", so two
+        // such processes each read the other's log lines as their OWN and skipped
+        // counting them (refreshFromLog) — undercounting the shared budget and
+        // jointly locking accounts. Mix the nonce with the real and monotonic
+        // clocks so distinct process starts never collide even at nonce==0.
+        const rid_nonce: u64 = @bitCast(@as(i64, krb5.rng.nonce(io) catch 0));
+        const rid_real: u64 = @bitCast(Io.Timestamp.now(io, .real).toMicroseconds());
+        const rid_awake: u64 = @bitCast(Io.Timestamp.now(io, .awake).toMicroseconds());
+        const rid_mix: u64 = (rid_nonce *% 0x9E3779B97F4A7C15) ^ (rid_real *% 0xD1B54A32D192ED03) ^ (rid_awake +% 1);
+        const run_id = std.fmt.bufPrint(&run_id_buf, "{x}", .{rid_mix}) catch "run";
 
         dedup_storage = dedup_mod.loadFromLog(allocator, io, state_path, scope) catch dedup_mod.Dedup.init(allocator, scope);
         store_storage = store_mod.Store.open(allocator, io, state_path, session.config.realm, dc) catch {

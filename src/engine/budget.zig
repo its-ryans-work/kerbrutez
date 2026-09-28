@@ -79,6 +79,12 @@ pub fn accountKey(buf: *[account_key_max]u8, user: []const u8) []const u8 {
     return buf[0..user.len];
 }
 
+/// Cap on per-user attempt timestamps held in memory. A real streak never nears
+/// this (an account locks/gets pulled well before); it only bounds pathological
+/// growth from a poisoned or future-dated shared log so one user can't OOM the
+/// run. Far above any real lockout threshold, so it never changes a decision.
+const max_streak_entries: usize = 4096;
+
 /// Minimum gap between filesystem checks in `refreshFromLog`.
 const min_refresh_ms: i64 = 1000;
 /// Cap on how much new log is folded in per refresh.
@@ -90,6 +96,13 @@ pub const Budget = struct {
     /// user -> ascending list of attempt timestamps (epoch seconds). Keys owned.
     attempts: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(i64)) = .{},
     lock: SpinLock = .{},
+    /// Serialises `refreshFromLog` across threads. Normally the caller holds the
+    /// cross-process file lock so only one thread refreshes at a time; but when
+    /// that lock is UNAVAILABLE (degraded mode) multiple workers call refresh
+    /// concurrently and would race on log_offset/last_refresh_ms — a lost offset
+    /// update re-reads or skips a chunk (double- or under-count). Separate from
+    /// `lock` (which addHistorical takes) to avoid re-entrant self-deadlock.
+    refresh_lock: SpinLock = .{},
     /// Shared state log to tail for other processes' attempts (see
     /// `refreshFromLog`). BORROW: owned by the caller.
     log_path: ?[]const u8 = null,
@@ -152,16 +165,20 @@ pub const Budget = struct {
     ///
     /// A clock stepped backwards makes the gap look smaller (never larger), so it
     /// errs toward keeping the streak: MORE pacing, never less. Safe.
-    fn resetIfQuiet(self: *Budget, list: *std.ArrayListUnmanaged(i64), now: i64) void {
+    /// Clear the streak if the most recent attempt was at least `quiet_secs` ago.
+    ///
+    /// The threshold differs by CALLER, because the streak serves two masters:
+    ///   * PACING (tryReserve) passes window+margin — a conservative cushion so we
+    ///     never start a fresh streak (and grant) before AD has surely reset, even
+    ///     for attempts arriving at ~exactly the window interval.
+    ///   * ESTIMATING AD's badPwdCount (windowCount, which feeds the collision
+    ///     check and the predictor) passes the bare window — AD resets on the
+    ///     observation window with NO margin, so adding margin here would make the
+    ///     estimate exceed AD's real count and falsely abort a safe resumed run.
+    fn resetIfQuiet(self: *Budget, list: *std.ArrayListUnmanaged(i64), now: i64, quiet_secs: i64) void {
+        _ = self;
         if (list.items.len == 0) return;
-        // Reset only after window+margin of silence, matching the at-capacity WAIT
-        // in tryReserve. Using the bare window here would clear our streak the
-        // instant AD's own window elapses, with no safety cushion — so attempts
-        // arriving at ~exactly the window interval (external --rpm/--delay pacing,
-        // or another operator) could reset us to 1 while AD, measuring the boundary
-        // slightly differently, is still counting up toward the threshold. The
-        // margin makes our reset strictly LATER than AD's, so we never under-count.
-        if (now - maxTs(list) >= self.policy.windowSecs() + self.policy.marginSecs()) list.clearRetainingCapacity();
+        if (now - maxTs(list) >= quiet_secs) list.clearRetainingCapacity();
     }
 
     /// Try to reserve an attempt slot for `user` at time `now` (epoch seconds).
@@ -171,7 +188,9 @@ pub const Budget = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const list = try self.listFor(user);
-        self.resetIfQuiet(list, now);
+        // Pacing: conservative reset (window+margin) so we never grant before AD
+        // has surely reset.
+        self.resetIfQuiet(list, now, self.policy.windowSecs() + self.policy.marginSecs());
         if (list.items.len < self.policy.attempts_per_window) {
             try list.append(self.allocator, now);
             return 0;
@@ -202,6 +221,13 @@ pub const Budget = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const list = try self.listFor(user);
+        // Cap per-user memory. A legitimate streak is tiny (<= threshold, since the
+        // account locks/gets pulled beyond that); a huge list can only come from a
+        // poisoned/future-dated shared log that keeps resetIfQuiet from firing.
+        // Once we hold far more than any threshold, the account is unambiguously
+        // over budget, so dropping further seeds changes no decision — it only
+        // bounds memory. (Over-count, never under: safe for lockout.)
+        if (list.items.len >= max_streak_entries) return;
         try list.append(self.allocator, ts);
     }
 
@@ -213,7 +239,8 @@ pub const Budget = struct {
         defer self.lock.unlock();
         var kbuf: [account_key_max]u8 = undefined;
         const list = self.attempts.getPtr(accountKey(&kbuf, user)) orelse return 0;
-        self.resetIfQuiet(list, now);
+        // Estimate AD's badPwdCount: AD resets on the bare observation window.
+        self.resetIfQuiet(list, now, self.policy.windowSecs());
         return list.items.len;
     }
 
@@ -249,6 +276,12 @@ pub const Budget = struct {
     /// does not stat/read the log on every single attempt.
     pub fn refreshFromLog(self: *Budget, io: Io, now_ms: i64) void {
         const path = self.log_path orelse return;
+        // Serialise the whole refresh: without this, concurrent workers in the
+        // no-file-lock degraded mode race on last_refresh_ms/log_offset and a lost
+        // offset update can skip a log chunk (under-count -> lockout). Held across
+        // the file read; addHistorical takes the separate `lock`, so no deadlock.
+        self.refresh_lock.lock();
+        defer self.refresh_lock.unlock();
         if (now_ms - self.last_refresh_ms < min_refresh_ms) return;
         self.last_refresh_ms = now_ms;
 
@@ -328,12 +361,11 @@ pub fn parseIso8601(s: []const u8) ?i64 {
     const mi = parseN(s[14..16]) orelse return null;
     const se = parseN(s[17..19]) orelse return null;
     if (mo < 1 or mo > 12 or d < 1 or d > 31) return null;
-    // Reject implausible years. A far-future timestamp (a skewed clock or a
-    // tampered shared log) would make maxTs believe the streak is "very recent"
-    // forever, so resetIfQuiet never fires and the user's attempt list grows
-    // without bound — a self-DoS. Records outside this range are skipped by the
-    // readers (orelse continue) or, for the locked-set, fail closed.
-    if (y < 1970 or y > 2100) return null;
+    // NOTE: no year bound here on purpose. Rejecting an out-of-range year would
+    // make the budget readers SKIP that attempt record (orelse continue) and
+    // under-count — a lockout-leaning failure. A future-dated timestamp instead
+    // over-counts (safe), and unbounded per-user growth from a poisoned log is
+    // bounded by the per-user list cap in addHistorical, not by rejecting dates.
     return daysFromCivil(@intCast(y), mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + se;
 }
 

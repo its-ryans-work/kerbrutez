@@ -9,6 +9,22 @@ const secret_file = @import("../util/secret_file.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
 const Status = @import("status.zig").Status;
 
+/// A byte that must never reach a terminal verbatim: a C0 control (except the
+/// `\n`/`\t` our own format strings use) or DEL. Attacker/AD-controlled data
+/// (sAMAccountName, SPN, BloodHound export, nxc capture) flows into both the
+/// console log AND the plain-text report files, so BOTH sinks scrub with this
+/// one predicate — a terminal escape sequence in a name could otherwise forge or
+/// hide findings when the operator cats the console output or a deliverable.
+pub fn isUnsafeControl(c: u8) bool {
+    return (c < 0x20 and c != '\n' and c != '\t') or c == 0x7F;
+}
+
+/// Write `s` to `w` with unsafe control bytes replaced by '?'. Shared by the
+/// report writers so they can't drift from the logger's neutralization.
+pub fn scrubControlsInto(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    for (s) |c| try w.writeByte(if (isUnsafeControl(c)) '?' else c);
+}
+
 pub const Level = enum(u8) {
     debug = 0,
     info = 1,
@@ -126,7 +142,7 @@ pub const Logger = struct {
         // with the timestamp — a forged line arrives conspicuously unprefixed.
         const msg = msg_buf[0..used];
         for (msg) |*c| {
-            if ((c.* < 0x20 and c.* != '\n' and c.* != '\t') or c.* == 0x7F) c.* = '?';
+            if (isUnsafeControl(c.*)) c.* = '?';
         }
 
         var ts_buf: [20]u8 = undefined;
